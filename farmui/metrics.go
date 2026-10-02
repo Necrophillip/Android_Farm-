@@ -156,5 +156,6 @@ func (s *Service) sample() {
 		}
 	}
 	s.metrics.prune(alive)
+	s.pruneShots(alive)
 	s.broadcast()
 }

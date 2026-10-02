@@ -19,7 +19,20 @@ const state = {
   recorder: { active: false, steps: [], lastTap: 0, device: null },
   // selected macro id per device name, persisted in localStorage
   macroChoice: JSON.parse(localStorage.getItem("farmui.macroChoice") || "{}"),
+  // live-view state: global switch + per-device opt-out (persisted)
+  live: JSON.parse(localStorage.getItem("farmui.live") || '{"global":true,"disabled":{}}'),
+  visible: new Set(),
+  observer: null,
 };
+
+function saveLive() {
+  localStorage.setItem("farmui.live", JSON.stringify(state.live));
+}
+
+// liveEnabled reports whether a device should stream frames.
+function liveEnabled(name) {
+  return !!state.live.global && !state.live.disabled[name];
+}
 
 function saveChoices() {
   localStorage.setItem("farmui.macroChoice", JSON.stringify(state.macroChoice));
@@ -164,14 +177,19 @@ function renderGrid() {
 function createCard(avd) {
   const el = document.createElement("article");
   el.className = "card glass";
+  el.dataset.name = avd.name;
   el.innerHTML = `
     <div class="card-head">
       <div class="card-title"><h3></h3><span class="sub"></span></div>
-      <span class="pill"><span class="dot"></span><span class="pill-text"></span></span>
+      <div class="card-head-actions">
+        <button class="icon-btn act-eye" title="Vista en vivo">👁</button>
+        <span class="pill"><span class="dot"></span><span class="pill-text"></span></span>
+      </div>
     </div>
     <div class="screen-wrap">
       <div class="screen-off"><span class="big">🖥️</span><span>Detenido</span></div>
       <img alt="Pantalla" style="display:none" />
+      <button class="icon-btn shot-btn hidden" title="Capturar ahora (bajo demanda)">📸</button>
     </div>
     <div class="metrics">
       <div class="metric"><div class="k">CPU</div><div class="v"><span class="cpu">—</span></div><div class="bar"><span class="cpu-bar" style="width:0%"></span></div></div>
@@ -192,7 +210,8 @@ function createCard(avd) {
     </div>`;
   const refs = {
     title: $("h3", el), sub: $(".sub", el), pill: $(".pill", el), pillText: $(".pill-text", el),
-    img: $("img", el), screenOff: $(".screen-off", el),
+    img: $("img", el), screenOff: $(".screen-off", el), shot: $(".shot-btn", el),
+    eye: $(".act-eye", el),
     cpu: $(".cpu", el), mem: $(".mem", el), mempct: $(".mempct", el),
     cpuBar: $(".cpu-bar", el), memBar: $(".mem-bar", el),
     start: $(".act-start", el), stop: $(".act-stop", el), console: $(".act-console", el),
@@ -205,11 +224,14 @@ function createCard(avd) {
   refs.console.addEventListener("click", () => openDrawer(avd.name));
   refs.opt.addEventListener("click", () => doOptimize(avd.name, refs.opt));
   refs.img.addEventListener("click", (e) => tapFromEvent(avd.name, refs.img, e));
+  refs.shot.addEventListener("click", (e) => { e.stopPropagation(); captureCardFrame(avd.name, true); });
+  refs.eye.addEventListener("click", () => toggleLiveDevice(avd.name));
   refs.select.addEventListener("change", () => {
     state.macroChoice[avd.name] = refs.select.value;
     saveChoices();
   });
   refs.run.addEventListener("click", () => toggleMacro(avd.name, refs.run));
+  observeCard(el);
   return { el, refs };
 }
 
@@ -225,13 +247,21 @@ function updateCard(card, avd) {
   refs.pill.className = `pill ${status}`;
   refs.pillText.textContent = label;
 
-  const live = avd.running && avd.booted;
-  refs.img.style.display = live ? "block" : "none";
-  refs.screenOff.style.display = live ? "none" : "grid";
-  if (!live) {
-    refs.screenOff.querySelector("span:last-child").textContent = avd.running ? "Arrancando Android…" : "Detenido";
-    refs.img.removeAttribute("src");
+  const booted = avd.running && avd.booted;
+  const streaming = booted && liveEnabled(avd.name);
+  refs.img.style.display = streaming ? "block" : "none";
+  refs.screenOff.style.display = streaming ? "none" : "grid";
+  if (!streaming) {
+    let label = "Detenido";
+    if (avd.running && !avd.booted) label = "Arrancando Android…";
+    else if (booted) label = "📺 Vista en vivo apagada";
+    refs.screenOff.querySelector("span:last-child").textContent = label;
+    if (!booted) refs.img.removeAttribute("src");
   }
+  refs.shot.classList.toggle("hidden", !(booted && !liveEnabled(avd.name)));
+  refs.eye.textContent = liveEnabled(avd.name) ? "👁" : "🚫";
+  refs.eye.classList.toggle("off", !liveEnabled(avd.name));
+  refs.eye.disabled = !avd.running;
 
   const m = avd.metrics;
   if (m && avd.running) {
@@ -247,7 +277,7 @@ function updateCard(card, avd) {
 
   refs.start.classList.toggle("hidden", !!avd.running);
   refs.stop.classList.toggle("hidden", !avd.running);
-  refs.console.disabled = !live;
+  refs.console.disabled = !booted;
 
   // Macro selector + run toggle, bound to this device
   const options = ['<option value="">— sin macro —</option>']
@@ -259,10 +289,10 @@ function updateCard(card, avd) {
   }
   const choice = state.macroChoice[avd.name] || "";
   if (refs.select.value !== choice) refs.select.value = choice;
-  refs.select.disabled = !live;
+  refs.select.disabled = !booted;
 
   const running = !!avd.macroId;
-  refs.run.disabled = !live && !running;
+  refs.run.disabled = !booted && !running;
   refs.run.classList.toggle("macro-on", running);
   refs.run.textContent = running ? "⏹ Detener" : "🧩 Ejecutar";
   const active = macroById(avd.macroId);
@@ -880,23 +910,33 @@ function closeDrawer() {
   $("#drawer-overlay").classList.add("hidden");
   $("#drawer").classList.add("hidden");
 }
+function fetchDrawerFrame(force) {
+  const name = state.drawer.name;
+  if (!name) return;
+  const url = `/api/instances/${encodeURIComponent(name)}/screenshot?t=${Date.now()}${force ? "&force=1" : ""}`;
+  const probe = new Image();
+  probe.onload = () => {
+    $("#drawer-img").src = url;
+    $("#drawer-loading").classList.add("hidden");
+    syncCanvasSize();
+  };
+  probe.src = url;
+}
+
 function startDrawerScreens() {
   clearInterval(state.drawer.timer);
-  const tick = () => {
-    const name = state.drawer.name;
-    if (!name) return;
-    const url = `/api/instances/${encodeURIComponent(name)}/screenshot?t=${Date.now()}`;
-    const probe = new Image();
-    probe.onload = () => {
-      const img = $("#drawer-img");
-      img.src = url;
-      $("#drawer-loading").classList.add("hidden");
-      syncCanvasSize();
-    };
-    probe.src = url;
-  };
-  tick();
-  state.drawer.timer = setInterval(tick, 1600);
+  const name = state.drawer.name;
+  if (!name) return;
+  const streaming = liveEnabled(name);
+  $("#drawer-capture").classList.toggle("hidden", streaming);
+  if (streaming) {
+    fetchDrawerFrame(false);
+    state.drawer.timer = setInterval(() => {
+      if (state.drawer.name && liveEnabled(state.drawer.name)) fetchDrawerFrame(false);
+    }, 1600);
+  } else {
+    fetchDrawerFrame(true);
+  }
 }
 
 function tapFromEvent(name, img, ev) {
@@ -977,18 +1017,81 @@ async function runShell() {
 }
 
 /* ---------------- Screenshots ---------------- */
+// observeCard tracks whether a card is visible in the viewport so we only
+// capture frames for what the user is actually looking at.
+function observeCard(el) {
+  if (!state.observer) {
+    state.observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        const name = entry.target.dataset.name;
+        if (!name) continue;
+        if (entry.isIntersecting) {
+          state.visible.add(name);
+          if (liveEnabled(name)) captureCardFrame(name, false);
+        } else {
+          state.visible.delete(name);
+        }
+      }
+    }, { threshold: 0.1 });
+  }
+  state.observer.observe(el);
+}
+
+function captureCardFrame(name, force) {
+  if (name === state.drawer.name) return; // the drawer owns this device's stream
+  const card = state.cards.get(name);
+  if (!card) return;
+  const url = `/api/instances/${encodeURIComponent(name)}/screenshot?t=${Date.now()}${force ? "&force=1" : ""}`;
+  const probe = new Image();
+  probe.onload = () => { card.refs.img.src = url; };
+  probe.src = url;
+}
+
+function toggleLiveDevice(name) {
+  if (state.live.disabled[name]) delete state.live.disabled[name];
+  else state.live.disabled[name] = true;
+  saveLive();
+  const card = state.cards.get(name);
+  const avd = state.avds.find((a) => a.name === name);
+  if (card && avd) updateCard(card, avd);
+  if (state.drawer.name === name) startDrawerScreens();
+  toast(liveEnabled(name) ? `👁 Vista en vivo activada: ${name}` : `🚫 Vista en vivo apagada: ${name}`, "info", 1800);
+}
+
+function toggleLiveGlobal() {
+  state.live.global = !state.live.global;
+  saveLive();
+  updateLiveToggle();
+  for (const avd of state.avds) {
+    const card = state.cards.get(avd.name);
+    if (card) updateCard(card, avd);
+  }
+  if (state.drawer.name) startDrawerScreens();
+  startScreenLoop();
+  if (state.live.global) {
+    for (const avd of state.avds) {
+      if (avd.running && avd.booted && state.visible.has(avd.name)) captureCardFrame(avd.name, false);
+    }
+  }
+  toast(state.live.global ? "📺 Vistas en vivo activadas" : "📺 Vistas en vivo apagadas (control y métricas siguen)", "info", 2600);
+}
+
+function updateLiveToggle() {
+  const b = $("#live-toggle");
+  if (!b) return;
+  b.textContent = state.live.global ? "📺 Vistas: ON" : "📺 Vistas: OFF";
+  b.classList.toggle("off", !state.live.global);
+}
+
 function startScreenLoop() {
   clearInterval(state.screenTimer);
   state.screenTimer = setInterval(() => {
-    if (document.hidden) return;
+    if (document.hidden || !state.live.global) return;
     for (const avd of state.avds) {
       if (!avd.running || !avd.booted) continue;
-      const card = state.cards.get(avd.name);
-      if (!card || card.refs.img.style.display === "none") continue;
-      const url = `/api/instances/${encodeURIComponent(avd.name)}/screenshot?t=${Date.now()}`;
-      const probe = new Image();
-      probe.onload = () => { card.refs.img.src = url; };
-      probe.src = url;
+      if (!liveEnabled(avd.name)) continue;
+      if (!state.visible.has(avd.name)) continue;
+      captureCardFrame(avd.name, false);
     }
   }, 1800);
 }
@@ -1061,6 +1164,8 @@ function bind() {
   $("#settings-gpu").addEventListener("change", updateGpuHint);
 
   $("#open-library").addEventListener("click", () => { $("#library-sub").textContent = "Ejecuta una macro sobre un dispositivo en ejecución."; openLibrary(); });
+  $("#live-toggle").addEventListener("click", toggleLiveGlobal);
+  $("#drawer-capture").addEventListener("click", () => fetchDrawerFrame(true));
   $("#open-bake").addEventListener("click", openBake);
   $("#bake-submit").addEventListener("click", submitBake);
   const apkFile = $("#apk-file");
@@ -1102,6 +1207,7 @@ function bind() {
 async function main() {
   buildStatic();
   bind();
+  updateLiveToggle();
   await bootstrap();
   connectSSE();
   startScreenLoop();

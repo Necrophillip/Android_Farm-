@@ -25,6 +25,7 @@ Android nativos en macOS (arm64). Combina:
 - [API REST](#api-rest)
 - [Parches a avdctl](#parches-a-avdctl)
 - [Rendimiento](#rendimiento)
+- [Visualización y consumo](#visualización-y-consumo)
 - [Limitaciones conocidas](#limitaciones-conocidas)
 - [Estructura del repo](#estructura-del-repo)
 - [Licencia y créditos](#licencia-y-créditos)
@@ -240,6 +241,32 @@ Medido en un M4 (16 GB), mismo hardware, tras el arranque:
 
 **Consejo:** usa siempre **Modo Lite** (AOSP `default`) para orquestar varios emuladores.
 Reserva las imágenes con Google Play Services solo cuando la app los necesite.
+
+---
+
+## Visualización y consumo
+
+Ver las pantallas en vivo es lo más caro de la granja: cada captura fuerza composición y
+**encode PNG en el invitado**, transferencia ADB y **decode en el navegador**. Con muchas
+instancias eso escala lineal y golpea CPU/GPU del host y del navegador. Por eso la
+visualización está **separada de la orquestación**:
+
+- **Plano de control (siempre activo):** métricas CPU/RAM, macros, shell, ADB y capturas
+  bajo demanda. Cuestan ~nada.
+- **Plano de visualización (opt-in y acotado):** streaming solo de lo que estás mirando.
+
+Controles:
+
+| Control | Qué hace |
+|---|---|
+| **📺 Vistas: ON/OFF** (header) | Enciende/apaga todas las vistas en vivo. Métricas y control siguen. |
+| **👁 / 🚫** (por tarjeta) | Activa/desactiva la vista en vivo de ese dispositivo. |
+| **📸** (tarjeta / consola) | Captura puntual `?force=1` cuando la vista está apagada. |
+| **Scroll** | Solo se capturan las tarjetas visibles; al salir del viewport se pausan y reanudan al volver. |
+| **Caché 1 s (backend)** | Varias pestañas/navegadores comparten una sola captura por dispositivo. |
+
+Nota: esto elimina el sobrecosto de farmui, pero **no** apaga el render propio del emulador
+(Metal/vsync) mientras esté corriendo — eso solo baja con menos resolución o menos emuladores.
 
 ---
 

@@ -30,6 +30,7 @@
     <div class="chips" id="system-chips"></div>
 
     <div class="topbar-actions">
+      <button class="btn ghost" id="live-toggle" title="Encender/apagar las vistas en vivo (métricas y control siguen activos)">📺 Vistas: ON</button>
       <button class="btn ghost" id="open-bake" title="Subir APKs y hornear golden images">📦 Bake</button>
       <button class="btn ghost" id="open-library" title="Macros guardadas">🧩 Macros</button>
       <button class="btn ghost" id="open-settings" title="Ajustes de rendimiento">⚙︎ Rendimiento</button>
@@ -146,6 +147,7 @@
       <canvas id="drawer-canvas"></canvas>
       <div class="screen-loading" id="drawer-loading">Cargando pantalla…</div>
     </div>
+    <button class="btn primary hidden" id="drawer-capture">📸 Capturar (vista en vivo apagada)</button>
 
     <div class="recorder glass">
       <div class="recorder-head">

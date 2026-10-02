@@ -377,7 +377,8 @@ func (s *Server) handleDeleteGolden(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleScreenshot(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	png, err := s.svc.Screenshot(name)
+	force := r.URL.Query().Get("force") == "1"
+	png, err := s.svc.Screenshot(name, force)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err)
 		return
