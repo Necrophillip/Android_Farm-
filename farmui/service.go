@@ -29,6 +29,8 @@ type Config struct {
 	MacroDir      string
 	GoldenDir     string
 	APKDir        string
+	NetFile       string
+	ProxyFile     string
 	GPU           string
 	Windowed      bool
 }
@@ -45,6 +47,8 @@ type Service struct {
 	runner    *macroRunner
 	apks      *apkStore
 	bake      *bakeManager
+	nets      *netProfileStore
+	proxies   *proxyStore
 	sizeCache sync.Map // device name -> [2]int (w,h)
 
 	shotMu    sync.Mutex
@@ -63,13 +67,15 @@ type cachedShot struct {
 
 // Snapshot is a full UI state pushed to subscribers over SSE.
 type Snapshot struct {
-	AVDS    []AVD      `json:"avds"`
-	System  SystemInfo `json:"system"`
-	Macros  []Macro    `json:"macros"`
-	APKs    []APK      `json:"apks"`
-	Goldens []Golden   `json:"goldens"`
-	Jobs    []BakeJob  `json:"jobs"`
-	At      int64      `json:"at"`
+	AVDS        []AVD                 `json:"avds"`
+	System      SystemInfo            `json:"system"`
+	Macros      []Macro               `json:"macros"`
+	APKs        []APK                 `json:"apks"`
+	Goldens     []Golden              `json:"goldens"`
+	Jobs        []BakeJob             `json:"jobs"`
+	NetProfiles map[string]NetProfile `json:"netProfiles,omitempty"`
+	Proxies     []Proxy               `json:"proxies,omitempty"`
+	At          int64                 `json:"at"`
 }
 
 func NewService(cfg Config) *Service {
@@ -85,6 +91,12 @@ func NewService(cfg Config) *Service {
 	}
 	if cfg.APKDir != "" {
 		s.apks = newAPKStore(cfg.APKDir)
+	}
+	if cfg.NetFile != "" {
+		s.nets = newNetProfileStore(cfg.NetFile)
+	}
+	if cfg.ProxyFile != "" {
+		s.proxies = newProxyStore(cfg.ProxyFile)
 	}
 	s.bake = newBakeManager(s)
 	s.runner = newMacroRunner(s)
@@ -138,7 +150,7 @@ func (s *Service) snapshot() *Snapshot {
 	if s.apks != nil {
 		apks = s.apks.list()
 	}
-	return &Snapshot{AVDS: avds, System: s.SystemInfo(), Macros: macros, APKs: apks, Goldens: s.ListGoldens(), Jobs: jobs, At: nowMillis()}
+	return &Snapshot{AVDS: avds, System: s.SystemInfo(), Macros: macros, APKs: apks, Goldens: s.ListGoldens(), Jobs: jobs, NetProfiles: s.NetProfiles(), Proxies: s.ListProxies(), At: nowMillis()}
 }
 
 // Macros lists saved macros.

@@ -21,6 +21,7 @@ Android nativos en macOS (arm64). Combina:
 - [Uso](#uso)
 - [Macros](#macros)
 - [Apps por ADB](#apps-por-adb)
+- [Región y tráfico](#región-y-tráfico)
 - [Arquitectura](#arquitectura)
 - [API REST](#api-rest)
 - [Parches a avdctl](#parches-a-avdctl)
@@ -160,6 +161,29 @@ dispositivo desde su consola. Los APKs viven en `~/.androidfarm/apks/`.
 
 ---
 
+## Región y tráfico
+
+Para validar tu apk según la región (los 32 estados de México) y analizar su tráfico:
+
+- **🌎 Región** (consola de cada dispositivo): localiza el contenedor a un estado —
+  **GPS** (`adb emu geo fix`), **zona horaria** (`persist.sys.timezone`) y **locale `es-MX`**.
+  Requiere `adb root` (la imagen *userdebug* del emulador lo permite).
+- **Proxy fijo por dispositivo**: define un proxy (`host:puerto`) que **tú controles**, aplicado
+  vía `settings put global http_proxy`. Es un proxy único para QA por región, **sin rotación**.
+- **Libreta de proxies**: guarda tus proxies (self-hosted o de pago) con una etiqueta y asígnalos
+  con un clic (💾 guardar · Usar · 🗑 borrar). Persistida en `~/.androidfarm/proxies.json`.
+- **Métricas de red**: cada tarjeta muestra **↓/↑ bytes/s** (y el acumulado rx/tx), leídos de
+  `/proc/net/dev` del invitado, útil para analizar patrones de tráfico por app/región.
+
+Asignación persistida en `~/.androidfarm/net.json`.
+
+> Cambiar la **IP de origen** requiere un proxy ubicado en esa región; el GPS/zona/locale sí se
+> pueden fijar localmente. FarmUI **no** genera, descubre ni rota proxies: solo administra los que
+> tú registres. ¿Dónde conseguir uno? Aloja el tuyo (Squid/3proxy/WireGuard en un VPS de la región)
+> o contrata un proveedor de proxies para testing.
+
+---
+
 ## Arquitectura
 
 ```
@@ -206,6 +230,10 @@ dispositivo desde su consola. Los APKs viven en `~/.androidfarm/apks/`.
 | `POST` | `/api/instances/{name}/apks/{id}/install` | Instalar APK. |
 | `DELETE` | `/api/instances/{name}/packages/{pkg}` | Desinstalar. |
 | `POST` | `/api/instances/{name}/packages/{pkg}/launch` | Abrir app. |
+| `POST` | `/api/instances/{name}/region` | Localizar el dispositivo a un estado MX `{state}` (GPS + TZ + locale). |
+| `POST` | `/api/instances/{name}/proxy` | Fijar/quitar proxy `{proxy}` (vacío = quitar). |
+| `GET` | `/api/regions` | Catálogo de los 32 estados con capital, coordenadas y TZ. |
+| `GET`/`POST`/`DELETE` | `/api/proxies[/{id}]` | Libreta de proxies del usuario (host:puerto). |
 | `GET`/`POST`/`DELETE` | `/api/apks[/{id}]` | Biblioteca de APKs (multipart). |
 | `GET`/`DELETE` | `/api/goldens[/{name}]` | Imágenes golden. |
 | `POST` | `/api/bake` · `GET /api/jobs` | Bake de golden con APKs (ver limitaciones). |

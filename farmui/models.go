@@ -109,6 +109,10 @@ type Metrics struct {
 	MemBytes  int64         `json:"memBytes"`
 	MemPct    float64       `json:"memPct"`
 	UptimeSec int64         `json:"uptimeSec"`
+	RxBytes   int64         `json:"rxBytes"`
+	TxBytes   int64         `json:"txBytes"`
+	RxRate    int64         `json:"rxRate"` // bytes/s
+	TxRate    int64         `json:"txRate"` // bytes/s
 	History   []MetricPoint `json:"history"`
 	UpdatedAt int64         `json:"updatedAt"`
 }

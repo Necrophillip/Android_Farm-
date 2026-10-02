@@ -23,6 +23,9 @@ const state = {
   live: JSON.parse(localStorage.getItem("farmui.live") || '{"global":true,"disabled":{}}'),
   visible: new Set(),
   observer: null,
+  regions: [],
+  netProfiles: {},
+  proxies: [],
 };
 
 function saveLive() {
@@ -194,6 +197,7 @@ function createCard(avd) {
     <div class="metrics">
       <div class="metric"><div class="k">CPU</div><div class="v"><span class="cpu">—</span></div><div class="bar"><span class="cpu-bar" style="width:0%"></span></div></div>
       <div class="metric"><div class="k">RAM</div><div class="v"><span class="mem">—</span> <small class="mempct"></small></div><div class="bar"><span class="mem-bar" style="width:0%"></span></div></div>
+      <div class="metric net" style="grid-column:1/-1"><div class="k">RED (↓ / ↑)</div><div class="v"><span class="net-rx">—</span> <small>↓</small> <span class="net-tx">—</span> <small>↑</small></div></div>
     </div>
     <div class="card-actions">
       <button class="btn primary act-start">▶ Arrancar</button>
@@ -214,6 +218,7 @@ function createCard(avd) {
     eye: $(".act-eye", el),
     cpu: $(".cpu", el), mem: $(".mem", el), mempct: $(".mempct", el),
     cpuBar: $(".cpu-bar", el), memBar: $(".mem-bar", el),
+    netRx: $(".net-rx", el), netTx: $(".net-tx", el),
     start: $(".act-start", el), stop: $(".act-stop", el), console: $(".act-console", el),
     opt: $(".act-opt", el), del: $(".act-del", el),
     select: $(".macro-select", el), run: $(".macro-run", el),
@@ -270,9 +275,12 @@ function updateCard(card, avd) {
     refs.mempct.textContent = `${(m.memPct || 0).toFixed(1)}%`;
     refs.cpuBar.style.width = `${Math.min(100, m.cpu / Math.max(navigator.hardwareConcurrency || 4, 1))}%`;
     refs.memBar.style.width = `${Math.min(100, m.memPct || 0)}%`;
+    refs.netRx.textContent = `${fmtBytes(m.rxRate || 0)}/s`;
+    refs.netTx.textContent = `${fmtBytes(m.txRate || 0)}/s`;
   } else {
     refs.cpu.textContent = "—"; refs.mem.textContent = "—"; refs.mempct.textContent = "";
     refs.cpuBar.style.width = "0%"; refs.memBar.style.width = "0%";
+    refs.netRx.textContent = "—"; refs.netTx.textContent = "—";
   }
 
   refs.start.classList.toggle("hidden", !!avd.running);
@@ -669,6 +677,97 @@ async function installSelectedAPK() {
   }
 }
 
+/* ---------------- Region / Network ---------------- */
+function populateRegions() {
+  const sel = $("#region-state");
+  if (!sel || sel.dataset.ready) return;
+  sel.innerHTML = state.regions
+    .map((r) => `<option value="${escapeHtml(r.code)}">${escapeHtml(r.name)} — ${escapeHtml(r.capital)}</option>`)
+    .join("");
+  sel.dataset.ready = "1";
+}
+
+function updateRegionCurrent() {
+  const el = $("#region-current");
+  if (!el) return;
+  const p = state.netProfiles[state.drawer.name];
+  if (!p) { el.textContent = ""; return; }
+  const region = state.regions.find((r) => r.code === p.state);
+  const parts = [];
+  if (region) parts.push(region.name);
+  if (p.proxy) parts.push(`proxy ${p.proxy}`);
+  el.textContent = parts.join(" · ");
+  $("#region-proxy").value = p.proxy || "";
+}
+
+async function applyRegion() {
+  const device = state.drawer.name;
+  const code = $("#region-state").value;
+  if (!device || !code) return;
+  const btn = $("#region-apply");
+  const prev = btn.textContent;
+  btn.disabled = true; btn.innerHTML = `<span class="spinner"></span>`;
+  try {
+    const r = await api("POST", `/api/instances/${encodeURIComponent(device)}/region`, { state: code });
+    toast(`🌎 ${device} → ${r.region.name} (${r.region.timezone})`, "ok");
+  } catch (e) {
+    toast(`Error al aplicar región: ${e.message}`, "err", 5000);
+  } finally {
+    btn.disabled = false; btn.textContent = prev;
+  }
+}
+
+async function applyProxy() {
+  const device = state.drawer.name;
+  const proxy = $("#region-proxy").value.trim();
+  if (!device) return;
+  try {
+    await api("POST", `/api/instances/${encodeURIComponent(device)}/proxy`, { proxy });
+    toast(proxy ? `🔌 Proxy aplicado: ${proxy}` : "🔌 Proxy quitado", "ok");
+  } catch (e) {
+    toast(`Error al aplicar proxy: ${e.message}`, "err", 5000);
+  }
+}
+
+function populateProxyList() {
+  const sel = $("#proxy-list");
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = state.proxies.length
+    ? state.proxies.map((p) => `<option value="${p.id}">${escapeHtml(p.label)} · ${escapeHtml(p.host)}:${p.port}</option>`).join("")
+    : `<option value="">— libreta vacía —</option>`;
+  if (prev && state.proxies.some((p) => p.id === prev)) sel.value = prev;
+}
+
+function proxyUse() {
+  const p = state.proxies.find((x) => x.id === $("#proxy-list").value);
+  if (!p) { toast("Libreta vacía. Guarda un proxy con 💾.", "info"); return; }
+  $("#region-proxy").value = `${p.host}:${p.port}`;
+  toast("Proxy cargado en el campo. Pulsa Aplicar.", "info", 2000);
+}
+
+async function proxySave() {
+  const proxy = $("#region-proxy").value.trim();
+  if (!proxy) { toast("Escribe host:puerto para guardar", "err"); return; }
+  try {
+    const p = await api("POST", "/api/proxies", { label: proxy, proxy });
+    toast(`💾 Guardado: ${p.label}`, "ok");
+  } catch (e) {
+    toast(`Error al guardar: ${e.message}`, "err", 5000);
+  }
+}
+
+async function proxyDelete() {
+  const id = $("#proxy-list").value;
+  if (!id) return;
+  try {
+    await api("DELETE", `/api/proxies/${encodeURIComponent(id)}`);
+    toast("🗑 Proxy borrado de la libreta", "info");
+  } catch (e) {
+    toast(`Error: ${e.message}`, "err");
+  }
+}
+
 /* ---------------- Recorder ---------------- */
 function recToggle() {
   const r = state.recorder;
@@ -902,6 +1001,9 @@ function openDrawer(name) {
   startDrawerScreens();
   syncCanvasSize();
   refreshApps();
+  populateRegions();
+  populateProxyList();
+  updateRegionCurrent();
 }
 function closeDrawer() {
   state.drawer.name = null;
@@ -1104,8 +1206,11 @@ function applySnapshot(data) {
   if (Array.isArray(data.apks)) state.apks = data.apks;
   if (Array.isArray(data.goldens)) state.goldens = data.goldens;
   if (Array.isArray(data.jobs)) state.jobs = data.jobs;
+  if (data.netProfiles) state.netProfiles = data.netProfiles;
+  if (Array.isArray(data.proxies)) { state.proxies = data.proxies; populateProxyList(); }
   if (Array.isArray(data.avds)) { state.avds = data.avds; renderGrid(); updateStats(); }
   renderBakeLists();
+  if (state.drawer.name) updateRegionCurrent();
   setOnline(true);
 }
 
@@ -1131,24 +1236,30 @@ function connectSSE() {
 
 async function bootstrap() {
   try {
-    const [system, avds, macros, apks, goldens] = await Promise.all([
+    const [system, avds, macros, apks, goldens, regions, proxies] = await Promise.all([
       api("GET", "/api/system"),
       api("GET", "/api/avds"),
       api("GET", "/api/macros"),
       api("GET", "/api/apks"),
       api("GET", "/api/goldens"),
+      api("GET", "/api/regions"),
+      api("GET", "/api/proxies"),
     ]);
     state.system = system;
     state.avds = avds;
     state.macros = macros || [];
     state.apks = apks || [];
     state.goldens = goldens || [];
+    state.regions = regions || [];
+    state.proxies = proxies || [];
     state.jobs = [];
     $("#image-list").innerHTML = (system.images || []).map((i) => `<option value="${escapeHtml(i)}"></option>`).join("");
     updateChips();
     renderGrid();
     updateStats();
     renderBakeLists();
+    populateRegions();
+    populateProxyList();
   } catch {
     setOnline(false);
   }
@@ -1194,6 +1305,11 @@ function bind() {
   $("#drawer-text").addEventListener("keydown", (e) => { if (e.key === "Enter") sendText(); });
   $("#apps-refresh").addEventListener("click", refreshApps);
   $("#apps-install").addEventListener("click", installSelectedAPK);
+  $("#region-apply").addEventListener("click", applyRegion);
+  $("#proxy-apply").addEventListener("click", applyProxy);
+  $("#proxy-use").addEventListener("click", proxyUse);
+  $("#proxy-save").addEventListener("click", proxySave);
+  $("#proxy-del").addEventListener("click", proxyDelete);
   $("#drawer-run").addEventListener("click", runShell);
   $("#drawer-cmd").addEventListener("keydown", (e) => { if (e.key === "Enter") runShell(); });
   $("#drawer-img").addEventListener("click", (e) => { if (state.drawer.name) tapFromEvent(state.drawer.name, $("#drawer-img"), e); });

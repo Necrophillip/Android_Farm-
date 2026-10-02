@@ -46,6 +46,8 @@ func main() {
 		MacroDir:      filepath.Join(homeDir(), ".androidfarm", "macros"),
 		GoldenDir:     filepath.Join(homeDir(), ".androidfarm", "goldens"),
 		APKDir:        filepath.Join(homeDir(), ".androidfarm", "apks"),
+		NetFile:       filepath.Join(homeDir(), ".androidfarm", "net.json"),
+		ProxyFile:     filepath.Join(homeDir(), ".androidfarm", "proxies.json"),
 		GPU:           *gpu,
 		Windowed:      *windowed,
 	}
