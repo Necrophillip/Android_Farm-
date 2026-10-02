@@ -1,0 +1,52 @@
+# Plantilla de flujo para TU app (staging o build de laboratorio).
+# Patrón: buscar -> seleccionar item -> scroll -> escribir "comentario" -> enviar -> screenshot.
+#
+# Reemplaza los selectores marcados con <<< >>> por los de tu app.
+# Obtén selectores reales con:
+#   adb -s emulator-5580 shell uiautomator dump /sdcard/ui.xml && adb -s emulator-5580 shell cat /sdcard/ui.xml
+# o usa Maestro Studio:  maestro --device emulator-5580 studio
+#
+# Variables:
+#   appId    -> id de tu aplicación (ej. com.miempresa.app.staging)
+#   QUERY    -> término de búsqueda
+#   COMMENT  -> texto del comentario
+#
+# Ejecutar con overrides:
+#   maestro test template-app-flow.yaml \
+#     --env appId=com.miempresa.app.staging \
+#     --env QUERY=demo \
+#     --env COMMENT="interacción simulada de laboratorio"
+appId: ${appId}
+---
+- launchApp:
+    clearState: true
+- takeScreenshot: "00-launch"
+
+# 1) Ir al buscador y buscar
+- tapOn: "Buscar"                      # <<< selector del campo/ícono de búsqueda
+- inputText: "${QUERY}"
+- hideKeyboard
+- assertVisible: "${QUERY}"
+- takeScreenshot: "01-search"
+
+# 2) Seleccionar el primer resultado relevante
+- tapOn:
+    text: "${QUERY}"
+    index: 0                            # <<< ajusta el índice/selector al item correcto
+- takeScreenshot: "02-item"
+
+# 3) Scroll dentro del detalle/comentarios
+- scroll
+- scroll
+- takeScreenshot: "03-scrolled"
+
+# 4) Escribir un comentario (en tu entorno controlado)
+- tapOn: "Añadir un comentario"        # <<< selector del input de comentario
+- inputText: "${COMMENT}"
+- takeScreenshot: "04-comment-typed"
+- tapOn: "Enviar"                      # <<< selector del botón enviar
+- assertVisible: "${COMMENT}"
+- takeScreenshot: "05-comment-posted"
+
+# 5) Verificación final de estado de la app (opcional)
+- assertVisible: "Inicio"              # <<< un ancla estable de tu UI

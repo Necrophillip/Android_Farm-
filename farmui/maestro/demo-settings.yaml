@@ -1,0 +1,28 @@
+# Demo reproducible: search -> scroll -> input -> screenshot
+# Target: AOSP Settings (viene incluido en la imagen default arm64-v8a).
+# Valida toda la cadena de UI automation: launch, tap, input, scroll, assert, screenshot.
+#
+# Ejecutar:
+#   maestro --device emulator-5580 test farmui/maestro/demo-settings.yaml
+appId: com.android.settings
+---
+- launchApp:
+    clearState: true
+- takeScreenshot: "00-home"
+
+# --- búsqueda ---
+- tapOn:
+    id: "com.android.settings:id/search_action_bar"
+- inputText: "wifi"
+- hideKeyboard
+- assertVisible: "Wi-Fi"
+- takeScreenshot: "01-search-results"
+
+# --- seleccionar un resultado ---
+- tapOn: "Wi-Fi"
+- takeScreenshot: "02-detail"
+
+# --- scroll dentro del detalle ---
+- scroll
+- scroll
+- takeScreenshot: "03-after-scroll"

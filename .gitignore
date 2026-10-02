@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Build outputs
+bin/
+**/bin/
+*.test
+*.out
+
+# Android / emulator artifacts
+*.apk
+*.xapk
+*.img
+*.qcow2
+*.log
+goldens/
+apks/
+macros/
+
+# Node
+node_modules/
+
+# Editors
+.idea/
+.vscode/
+*.swp

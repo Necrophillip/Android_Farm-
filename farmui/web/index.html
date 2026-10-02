@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark" />
+  <title>Android Farm · Control de Emuladores</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="bg-mesh" aria-hidden="true">
+    <div class="orb orb-a"></div>
+    <div class="orb orb-b"></div>
+    <div class="orb orb-c"></div>
+    <div class="grain"></div>
+  </div>
+
+  <header class="topbar glass">
+    <div class="brand">
+      <div class="brand-mark">🤖</div>
+      <div class="brand-text">
+        <h1>Android&nbsp;Farm</h1>
+        <span id="server-status" class="brand-sub">Conectando…</span>
+      </div>
+    </div>
+
+    <div class="chips" id="system-chips"></div>
+
+    <div class="topbar-actions">
+      <button class="btn ghost" id="open-bake" title="Subir APKs y hornear golden images">📦 Bake</button>
+      <button class="btn ghost" id="open-library" title="Macros guardadas">🧩 Macros</button>
+      <button class="btn ghost" id="open-settings" title="Ajustes de rendimiento">⚙︎ Rendimiento</button>
+      <button class="btn primary" id="open-create">＋ Nuevo AVD</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="stats" id="stats" aria-label="Resumen"></section>
+
+    <section class="section-head">
+      <h2>Dispositivos</h2>
+      <span class="muted" id="devices-count"></span>
+    </section>
+
+    <section id="grid" class="grid" aria-live="polite"></section>
+
+    <section id="empty" class="empty glass hidden">
+      <div class="empty-emoji">📱</div>
+      <h3>Sin emuladores todavía</h3>
+      <p>Crea tu primer Android Virtual Device para empezar a orquestar la granja.</p>
+      <button class="btn primary" id="empty-create">Crear AVD</button>
+    </section>
+  </main>
+
+  <!-- Create modal -->
+  <div class="overlay hidden" id="create-overlay">
+    <div class="modal glass" role="dialog" aria-modal="true" aria-labelledby="create-title">
+      <button class="icon-btn close" data-close="create-overlay">✕</button>
+      <h2 id="create-title">Nuevo Android Virtual Device</h2>
+      <p class="muted">La imagen del sistema se descarga automáticamente si falta.</p>
+
+      <label class="field">
+        <span>Nombre</span>
+        <input id="create-name" placeholder="base-a35" autocomplete="off" />
+      </label>
+
+      <label class="field">
+        <span>System image</span>
+        <input id="create-image" list="image-list" placeholder="system-images;android-35;google_apis_playstore;arm64-v8a" autocomplete="off" />
+        <datalist id="image-list"></datalist>
+      </label>
+
+      <label class="field">
+        <span>Perfil de dispositivo</span>
+        <input id="create-device" list="device-list" value="pixel_6" autocomplete="off" />
+        <datalist id="device-list">
+          <option value="pixel_6"></option>
+          <option value="pixel_6_pro"></option>
+          <option value="pixel_7"></option>
+          <option value="pixel_7_pro"></option>
+          <option value="pixel_8"></option>
+          <option value="pixel_8_pro"></option>
+          <option value="pixel_tablet"></option>
+        </datalist>
+      </label>
+
+      <label class="switch">
+        <input type="checkbox" id="create-lite" checked />
+        <span class="track"><span class="knob"></span></span>
+        <span class="switch-label">Modo ligero · AOSP (sin Google Play), 2 vCPU · 2 GB · 720p</span>
+      </label>
+
+      <div class="modal-actions">
+        <button class="btn ghost" data-close="create-overlay">Cancelar</button>
+        <button class="btn primary" id="create-submit">Crear dispositivo</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings drawer -->
+  <div class="overlay hidden" id="settings-overlay">
+    <div class="modal glass" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <button class="icon-btn close" data-close="settings-overlay">✕</button>
+      <h2 id="settings-title">Rendimiento &amp; arquitectura</h2>
+      <p class="muted">Ajusta cómo arranca el motor de Google en este Mac.</p>
+
+      <label class="field">
+        <span>Backend gráfico (<code>-gpu</code>)</span>
+        <select id="settings-gpu">
+          <option value="host">host · Metal (acelerado)</option>
+          <option value="auto">auto · automático</option>
+          <option value="angle_indirect">angle_indirect · ANGLE</option>
+          <option value="swiftshader_indirect">swiftshader_indirect · software</option>
+        </select>
+      </label>
+
+      <label class="switch">
+        <input type="checkbox" id="settings-windowed" />
+        <span class="track"><span class="knob"></span></span>
+        <span class="switch-label">Mostrar ventana del emulador</span>
+      </label>
+
+      <p class="hint" id="gpu-hint"></p>
+
+      <div class="modal-actions">
+        <button class="btn ghost" data-close="settings-overlay">Cerrar</button>
+        <button class="btn primary" id="settings-save">Aplicar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Device console slide-over -->
+  <div class="drawer-overlay hidden" id="drawer-overlay"></div>
+  <aside class="drawer glass hidden" id="drawer" aria-label="Consola del dispositivo">
+    <button class="icon-btn close" id="drawer-close">✕</button>
+    <div class="drawer-head">
+      <h3 id="drawer-title">Dispositivo</h3>
+      <span class="muted" id="drawer-sub"></span>
+    </div>
+
+    <div class="drawer-screen" id="drawer-screen">
+      <img id="drawer-img" alt="Pantalla del dispositivo" />
+      <canvas id="drawer-canvas"></canvas>
+      <div class="screen-loading" id="drawer-loading">Cargando pantalla…</div>
+    </div>
+
+    <div class="recorder glass">
+      <div class="recorder-head">
+        <span class="rec-dot" id="rec-dot"></span>
+        <strong id="rec-state">Grabadora</strong>
+        <span class="muted" id="rec-count">0 pasos</span>
+      </div>
+      <p class="hint">Arrastra sobre el lienzo para <b>trazar taps y swipes</b>; escribe texto abajo. Cada trazo se dibuja y se añade como paso.</p>
+      <div class="card-actions">
+        <button class="btn primary" id="rec-toggle">⏺ Grabar</button>
+        <button class="btn ghost" id="rec-undo" disabled>↶ Deshacer</button>
+        <button class="btn ghost" id="rec-clear" disabled>🗑 Limpiar</button>
+      </div>
+      <button class="btn ghost" id="rec-save" disabled>💾 Guardar macro…</button>
+      <div class="rec-list" id="rec-list"></div>
+    </div>
+
+    <div class="textrow">
+      <input id="drawer-text" placeholder="Escribe texto y pulsa Enviar…" autocomplete="off" />
+      <button class="btn ghost" id="drawer-send-text">Enviar</button>
+    </div>
+
+    <div class="apps glass">
+      <div class="recorder-head">
+        <strong>📦 Apps</strong>
+        <button class="btn ghost" id="apps-refresh" style="margin-left:auto">↻ Refrescar</button>
+      </div>
+      <div class="textrow">
+        <select id="apps-apk" class="macro-select"></select>
+        <button class="btn primary" id="apps-install">Instalar</button>
+      </div>
+      <div class="apps-list" id="apps-list"></div>
+    </div>
+
+    <div class="keyrow">
+      <button class="btn tile" data-key="3">⌂</button>
+      <button class="btn tile" data-key="4">←</button>
+      <button class="btn tile" data-key="187">▢</button>
+      <button class="btn tile" data-key="26">⏻</button>
+    </div>
+
+    <label class="field">
+      <span>Shell (adb shell)</span>
+      <div class="textrow">
+        <input id="drawer-cmd" placeholder="getprop ro.product.cpu.abi" autocomplete="off" />
+        <button class="btn primary" id="drawer-run">▶</button>
+      </div>
+    </label>
+    <pre id="drawer-out" class="console">Esperando comando…</pre>
+  </aside>
+
+  <div id="toasts" class="toasts" aria-live="assertive"></div>
+
+  <!-- Save macro modal -->
+  <div class="overlay hidden" id="macro-overlay">
+    <div class="modal glass" role="dialog" aria-modal="true" aria-labelledby="macro-title">
+      <button class="icon-btn close" data-close="macro-overlay">✕</button>
+      <h2 id="macro-title">Guardar macro</h2>
+      <p class="muted" id="macro-summary"></p>
+
+      <label class="field">
+        <span>Nombre de la macro</span>
+        <input id="macro-name" placeholder="buscar-y-comentar" autocomplete="off" />
+      </label>
+
+      <label class="field">
+        <span>App objetivo (opcional)</span>
+        <input id="macro-app" placeholder="com.tuapp.staging" autocomplete="off" />
+      </label>
+
+      <div class="macro-preview" id="macro-preview"></div>
+
+      <div class="modal-actions">
+        <button class="btn ghost" data-close="macro-overlay">Cancelar</button>
+        <button class="btn primary" id="macro-confirm">Confirmar y guardar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Macro library modal -->
+  <div class="overlay hidden" id="library-overlay">
+    <div class="modal glass" role="dialog" aria-modal="true" aria-labelledby="library-title">
+      <button class="icon-btn close" data-close="library-overlay">✕</button>
+      <h2 id="library-title">Macros guardadas</h2>
+      <p class="muted" id="library-sub">Ejecuta una macro sobre un dispositivo en ejecución.</p>
+      <div id="library-list" class="library-list"></div>
+    </div>
+  </div>
+
+  <!-- Bake modal -->
+  <div class="overlay hidden" id="bake-overlay">
+    <div class="modal glass wide" role="dialog" aria-modal="true" aria-labelledby="bake-title">
+      <button class="icon-btn close" data-close="bake-overlay">✕</button>
+      <h2 id="bake-title">📦 Bake APK → Golden image</h2>
+      <p class="muted">Sube APKs, hornea una imagen golden y lanza clones.</p>
+
+      <div class="bake-grid">
+        <section class="bake-sec">
+          <h3>1 · APKs de testing</h3>
+          <label class="dropzone" id="apk-drop">
+            <input type="file" id="apk-file" multiple accept=".apk,.xapk" hidden />
+            <span>Arrastra APKs aquí o haz clic para subir</span>
+          </label>
+          <div id="apk-list" class="library-list"></div>
+        </section>
+
+        <section class="bake-sec">
+          <h3>2 · Hornear</h3>
+          <label class="field"><span>Nombre del golden</span><input id="bake-name" placeholder="golden-demo" autocomplete="off" /></label>
+          <label class="field"><span>AVD base (se crea si no existe)</span><input id="bake-base" placeholder="golden-demo-base" autocomplete="off" /></label>
+          <label class="field"><span>System image</span><input id="bake-image" list="image-list" placeholder="(por defecto: AOSP arm64)" autocomplete="off" /></label>
+          <label class="field"><span>Perfil de dispositivo</span><input id="bake-device" value="pixel_6" autocomplete="off" /></label>
+          <button class="btn primary" id="bake-submit">🔥 Hornear golden</button>
+        </section>
+      </div>
+
+      <section class="bake-sec">
+        <h3>3 · Jobs</h3>
+        <div id="jobs-list" class="library-list"></div>
+      </section>
+
+      <section class="bake-sec">
+        <h3>4 · Goldens listos</h3>
+        <div id="goldens-list" class="library-list"></div>
+      </section>
+    </div>
+  </div>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

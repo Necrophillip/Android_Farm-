@@ -1,0 +1,1883 @@
+// Copyright (C) 2025 Forkbomb B.V.
+// License: AGPL-3.0-only
+
+package avd
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+)
+
+type Info struct {
+	Name      string `json:"name"`
+	Path      string `json:"path"`
+	Userdata  string `json:"userdata"`
+	SizeBytes int64  `json:"size_bytes"`
+}
+
+const cloneFingerprintFilename = ".golden.fingerprint"
+
+// BootProgressFunc is called to report boot progress status.
+type BootProgressFunc func(status string, elapsed time.Duration)
+
+func commandStderrWriter(env Env, bin string, args []string, buf *bytes.Buffer) io.Writer {
+	logWriter := newCommandLogWriter(env, bin, args)
+	if buf != nil {
+		return io.MultiWriter(buf, logWriter)
+	}
+	return logWriter
+}
+
+func run(env Env, bin string, args ...string) error {
+	var buf bytes.Buffer
+	errWriter := commandStderrWriter(env, bin, args, &buf)
+	if err := runCommandWithEnv(env.Context, nil, nil, &buf, errWriter, bin, args...); err != nil {
+		return fmt.Errorf("%s %v failed: %v\n%s", bin, args, err, buf.String())
+	}
+	return nil
+}
+
+func runWithContext(ctx context.Context, env Env, bin string, args ...string) error {
+	var buf bytes.Buffer
+	errWriter := commandStderrWriter(env, bin, args, &buf)
+	if err := runCommandWithEnv(ctx, nil, nil, &buf, errWriter, bin, args...); err != nil {
+		return fmt.Errorf("%s %v failed: %v\n%s", bin, args, err, buf.String())
+	}
+	return nil
+}
+
+func List(env Env) ([]Info, error) {
+	_, span := startSpan(env, "avd.List")
+	defer span.End()
+	entries, err := os.ReadDir(env.AVDHome)
+	if err != nil {
+		recordSpanError(span, err)
+		return nil, err
+	}
+	var out []Info
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasSuffix(e.Name(), ".avd") {
+			continue
+		}
+		name := strings.TrimSuffix(e.Name(), ".avd")
+		dir := filepath.Join(env.AVDHome, e.Name())
+		ud := filepath.Join(dir, "userdata-qemu.img.qcow2")
+		if _, err := os.Stat(ud); err != nil {
+			ud = filepath.Join(dir, "userdata.img")
+		}
+		var sz int64
+		if st, err := os.Stat(ud); err == nil {
+			sz = st.Size()
+		}
+		out = append(out, Info{Name: name, Path: dir, Userdata: ud, SizeBytes: sz})
+	}
+	return out, nil
+}
+
+func ensureSysImg(env Env, pkg string) error {
+	if env.SDKRoot != "" {
+		// quick existence probe
+		parts := strings.Split(pkg, ";")
+		if len(parts) >= 3 {
+			p := filepath.Join(env.SDKRoot, "system-images", parts[1], parts[2], env.abi())
+			if _, err := os.Stat(p); err == nil {
+				return nil
+			}
+		}
+	}
+	// install via sdkmanager
+	// accept licenses if needed
+	_ = run(env, env.SdkManager, "--licenses")
+	return run(env, env.SdkManager, pkg)
+}
+
+func InitBase(env Env, name, sysImage, device string) (Info, error) {
+	if name == "" {
+		return Info{}, errors.New("empty AVD name")
+	}
+	if err := os.MkdirAll(env.AVDHome, 0o755); err != nil {
+		return Info{}, err
+	}
+	if err := ensureSysImg(env, sysImage); err != nil {
+		return Info{}, fmt.Errorf("failed to ensure system image: %w", err)
+	}
+	out, err := runCommandCombinedOutputWithEnv(env.Context, nil, strings.NewReader("no\n"), env.AvdMgr, "create", "avd",
+		"-n", name, "-k", sysImage, "-d", device, "--force")
+	if err != nil {
+		return Info{}, fmt.Errorf("avdmanager create: %v\n%s", err, out)
+	}
+	// avdmanager generates a config.ini with disk.dataPartition.path=<temp>,
+	// which makes /data ephemeral (installs/config are discarded on shutdown).
+	// Make the data partition persistent so booted changes survive a reboot.
+	if err := persistDataPartition(filepath.Join(env.AVDHome, name+".avd")); err != nil {
+		return Info{}, fmt.Errorf("persist data partition: %w", err)
+	}
+	return infoOf(env, name)
+}
+
+// persistDataPartition normalizes a freshly created AVD so that userdata
+// writes (APK installs, settings) survive reboots:
+//   - removes the ephemeral disk.dataPartition.path=<temp> override
+//   - disables QuickBoot/FastBoot snapshot restore, which otherwise discards
+//     the running /data on every cold boot
+//   - uses a persistent data partition
+func persistDataPartition(avdPath string) error {
+	cfgPath := filepath.Join(avdPath, "config.ini")
+	b, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(b), "\n")
+	out := make([]string, 0, len(lines)+4)
+	for _, l := range lines {
+		trimmed := strings.TrimSpace(l)
+		if strings.HasPrefix(trimmed, "disk.dataPartition.path=") ||
+			strings.HasPrefix(trimmed, "disk.dataPartition.initPath=") ||
+			strings.HasPrefix(trimmed, "userdata.useQcow2=") ||
+			strings.HasPrefix(trimmed, "QuickBoot.mode=") ||
+			strings.HasPrefix(trimmed, "snapshot.present=") ||
+			strings.HasPrefix(trimmed, "fastboot.") ||
+			strings.HasPrefix(trimmed, "firstboot.") {
+			continue
+		}
+		out = append(out, l)
+	}
+	out = append(out,
+		"QuickBoot.mode=disabled",
+		"snapshot.present=false",
+		"fastboot.forceColdBoot=yes",
+		"fastboot.forceFastBoot=no",
+		"userdata.useQcow2=no",
+	)
+	if err := os.WriteFile(cfgPath, []byte(strings.Join(out, "\n")), 0o644); err != nil {
+		return err
+	}
+	// Stale snapshots would still be restored; remove them.
+	_ = os.RemoveAll(filepath.Join(avdPath, "snapshots"))
+	return nil
+}
+
+// SaveGolden exports an AVD's writable images (userdata, encryptionkey, cache) to a golden directory.
+// Converts qcow2 overlays to raw IMG format to prevent Android emulator from re-creating overlays on boot.
+// Returns the golden directory path and total size.
+func SaveGolden(env Env, name, dest string) (string, int64, error) {
+	avdPath := filepath.Join(env.AVDHome, name+".avd")
+
+	// Create golden directory
+	goldenDir := dest
+	if filepath.Ext(dest) == ".qcow2" {
+		// Legacy single-file mode: create directory instead
+		goldenDir = strings.TrimSuffix(dest, ".qcow2")
+	}
+	if err := os.MkdirAll(goldenDir, 0o755); err != nil {
+		return "", 0, err
+	}
+
+	// List of writable images to save (base name)
+	images := []string{"userdata-qemu.img", "encryptionkey.img", "cache.img", "sdcard.img"}
+	var totalSize int64
+
+	for _, img := range images {
+		// Prefer qcow2 overlay (has customizations), fallback to raw
+		src := filepath.Join(avdPath, img+".qcow2")
+		if _, err := os.Stat(src); err != nil {
+			src = filepath.Join(avdPath, img)
+			if _, err2 := os.Stat(src); err2 != nil {
+				continue // Skip if not found
+			}
+		}
+
+		// Convert to raw IMG (not qcow2) to prevent emulator from creating overlays
+		dstFile := filepath.Join(goldenDir, img)
+		tmp := dstFile + ".tmp"
+		if err := run(env, env.QemuImg, "convert", "-O", "raw", src, tmp); err != nil {
+			return "", 0, fmt.Errorf("convert %s: %w", img, err)
+		}
+		if err := os.Rename(tmp, dstFile); err != nil {
+			return "", 0, err
+		}
+		if st, err := os.Stat(dstFile); err == nil {
+			totalSize += st.Size()
+		}
+	}
+
+	return goldenDir, totalSize, nil
+}
+
+// CloneFromGolden creates a new AVD directory by copying raw IMG files from golden directory.
+// Uses full file copy (not QCOW2 overlays) to preserve all customizations independently.
+// It symlinks the base AVD's read-only files (system images, ROMs) and copies writable images.
+// Cloning takes time proportional to golden image size but ensures full isolation.
+func CloneFromGolden(env Env, base, name, golden string) (Info, error) {
+	_, span := startSpan(
+		env,
+		"avd.CloneFromGolden",
+		attribute.String("base", base),
+		attribute.String("clone", name),
+	)
+	defer span.End()
+	logEvent(
+		env,
+		"avd clone start",
+		"base",
+		base,
+		"clone",
+		name,
+		"golden_path",
+		golden,
+	)
+	baseDir := filepath.Join(env.AVDHome, base+".avd")
+	cloneDir := filepath.Join(env.AVDHome, name+".avd")
+
+	if _, err := os.Stat(baseDir); err != nil {
+		recordSpanError(span, err)
+		return Info{}, fmt.Errorf("base AVD not found: %w", err)
+	}
+
+	// Resolve golden path (can be directory or legacy .qcow2 file)
+	goldenDir := golden
+	if filepath.Ext(golden) == ".qcow2" {
+		goldenDir = filepath.Dir(golden)
+	}
+	absGoldenDir, err := filepath.Abs(goldenDir)
+	if err != nil {
+		recordSpanError(span, err)
+		return Info{}, fmt.Errorf("resolve golden path: %w", err)
+	}
+	fingerprint, err := goldenFingerprint(absGoldenDir)
+	if err != nil {
+		recordSpanError(span, err)
+		return Info{}, fmt.Errorf("fingerprint golden: %w", err)
+	}
+	if matches, err := cloneMatchesFingerprint(cloneDir, fingerprint); err != nil {
+		recordSpanError(span, err)
+		return Info{}, err
+	} else if matches {
+		return infoOf(env, name)
+	}
+	if _, err := os.Stat(filepath.Join(env.AVDHome, name+".ini")); err == nil {
+		return Info{}, fmt.Errorf("clone name conflict: %s already exists", name)
+	}
+	if err := os.Mkdir(cloneDir, 0o755); err != nil {
+		recordSpanError(span, err)
+		return Info{}, err
+	}
+
+	// ---------------------------------------------------------------------
+	// 1. Copy or template the config.ini and disable qcow2
+	// ---------------------------------------------------------------------
+	tpl := os.Getenv("AVDCTL_CONFIG_TEMPLATE")
+	dstCfg := filepath.Join(cloneDir, "config.ini")
+	var cfgBytes []byte
+
+	switch {
+	case tpl != "":
+		cfgBytes, err = os.ReadFile(tpl)
+		if err != nil {
+			recordSpanError(span, err)
+			return Info{}, fmt.Errorf("read template: %w", err)
+		}
+	default:
+		cfgBytes, err = os.ReadFile(filepath.Join(baseDir, "config.ini"))
+		if err != nil {
+			recordSpanError(span, err)
+			return Info{}, fmt.Errorf("read base config: %w", err)
+		}
+	}
+
+	cfgBytes = sanitizeConfigINI(cfgBytes)
+	// Disable QCOW2 overlays (use raw IMG full copies)
+	cfgStr := string(cfgBytes)
+	cfgStr = strings.ReplaceAll(cfgStr, "userdata.useQcow2=yes", "userdata.useQcow2=no")
+	if !strings.Contains(cfgStr, "userdata.useQcow2") {
+		cfgStr += "\nuserdata.useQcow2=no\n"
+	}
+	if err := os.WriteFile(dstCfg, []byte(cfgStr), 0o644); err != nil {
+		recordSpanError(span, err)
+		return Info{}, fmt.Errorf("write clone config: %w", err)
+	}
+
+	// ---------------------------------------------------------------------
+	// 2. Symlink read-only artifacts from base to clone
+	// ---------------------------------------------------------------------
+	err = filepath.WalkDir(baseDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == baseDir {
+			return nil
+		}
+		rel, _ := filepath.Rel(baseDir, path)
+
+		// Skip: snapshots, cache*, userdata*, encryptionkey*, config.ini, locks
+		if strings.HasPrefix(rel, "snapshots") ||
+			strings.HasPrefix(rel, "cache") ||
+			strings.HasPrefix(rel, "userdata") ||
+			strings.HasPrefix(rel, "encryptionkey") ||
+			rel == "config.ini" ||
+			strings.HasSuffix(rel, ".lock") {
+			return nil
+		}
+
+		dst := filepath.Join(cloneDir, rel)
+		if d.IsDir() {
+			return os.MkdirAll(dst, 0o755)
+		}
+		// Symlink
+		if err := os.Symlink(path, dst); err != nil && !os.IsExist(err) {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		recordSpanError(span, err)
+		return Info{}, err
+	}
+
+	// ---------------------------------------------------------------------
+	// 3. Copy raw IMG files from golden directory (full copy, no overlays)
+	// ---------------------------------------------------------------------
+	images := []string{"userdata-qemu.img", "encryptionkey.img", "cache.img", "sdcard.img"}
+	for _, img := range images {
+		goldenFile := filepath.Join(absGoldenDir, img)
+		if _, err := os.Stat(goldenFile); err != nil {
+			// If sdcard.img is missing, create it from config.ini sdcard.size
+			if img == "sdcard.img" {
+				if err := createSDCard(env, cloneDir, dstCfg); err != nil {
+					recordSpanError(span, err)
+					return Info{}, fmt.Errorf("create sdcard: %w", err)
+				}
+			}
+			continue // Skip if golden image doesn't exist
+		}
+
+		dstFile := filepath.Join(cloneDir, img)
+		// Sparse-preserving copy: a plain io.Copy would materialize the full
+		// virtual size (e.g. 10G) per clone, exhausting disk on a farm.
+		if err := sparseCopy(env, goldenFile, dstFile); err != nil {
+			recordSpanError(span, err)
+			return Info{}, fmt.Errorf("copy %s: %w", img, err)
+		}
+	}
+
+	// ---------------------------------------------------------------------
+	// 4. Remove stale snapshot dirs and qcow2 overlays if any
+	// ---------------------------------------------------------------------
+	_ = os.RemoveAll(filepath.Join(cloneDir, "snapshots"))
+
+	// Remove any leftover qcow2 overlay files to ensure clean raw IMG usage
+	qcow2Files, _ := filepath.Glob(filepath.Join(cloneDir, "*.qcow2"))
+	for _, f := range qcow2Files {
+		_ = os.Remove(f)
+	}
+
+	// ---------------------------------------------------------------------
+	// 5. Create the .ini file
+	// ---------------------------------------------------------------------
+	ini := filepath.Join(env.AVDHome, name+".ini")
+	body := fmt.Sprintf(
+		"avd.ini.encoding=UTF-8\npath=%s\npath.rel=avd/%s\n",
+		cloneDir, name+".avd",
+	)
+	if err := os.WriteFile(ini, []byte(body), 0o644); err != nil {
+		return Info{}, err
+	}
+	if err := writeCloneFingerprint(cloneDir, fingerprint); err != nil {
+		return Info{}, err
+	}
+
+	// ---------------------------------------------------------------------
+	// 6. Report size & info
+	// ---------------------------------------------------------------------
+	// Check for raw IMG first (full copy), fallback to QCOW2 overlay
+	userdata := filepath.Join(cloneDir, "userdata-qemu.img")
+	fi, err := os.Stat(userdata)
+	if err != nil {
+		userdata = filepath.Join(cloneDir, "userdata-qemu.img.qcow2")
+		fi, err = os.Stat(userdata)
+		if err != nil {
+			recordSpanError(span, err)
+			return Info{}, fmt.Errorf("stat userdata: %w", err)
+		}
+	}
+	info := Info{
+		Name:      name,
+		Path:      cloneDir,
+		Userdata:  userdata,
+		SizeBytes: fi.Size(),
+	}
+	logEvent(
+		env,
+		"avd clone finished",
+		"clone",
+		name,
+		"path",
+		cloneDir,
+		"userdata",
+		userdata,
+		"size_bytes",
+		fi.Size(),
+	)
+	return info, nil
+}
+
+// sparseCopy copies a raw image while preserving holes, keeping clones small
+// (e.g. ~750M instead of a fully materialized 10G). Prefers qemu-img, which
+// writes sparse output, and falls back to a chunked copy that skips zero runs.
+func sparseCopy(env Env, src, dst string) error {
+	if env.QemuImg != "" {
+		if err := run(env, env.QemuImg, "convert", "-f", "raw", "-O", "raw", src, dst); err == nil {
+			return nil
+		}
+	}
+	return copySkippingZeros(src, dst)
+}
+
+func copySkippingZeros(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	const chunk = 1 << 20 // 1 MiB
+	buf := make([]byte, chunk)
+	var offset int64
+	for {
+		n, readErr := io.ReadFull(in, buf)
+		if n > 0 {
+			if !isAllZero(buf[:n]) {
+				if _, werr := out.WriteAt(buf[:n], offset); werr != nil {
+					return werr
+				}
+			}
+			offset += int64(n)
+		}
+		if readErr != nil {
+			if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+				break
+			}
+			return readErr
+		}
+	}
+	return out.Truncate(offset)
+}
+
+func isAllZero(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func sanitizeConfigINI(b []byte) []byte {
+	lines := strings.Split(string(b), "\n")
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		if strings.HasPrefix(l, "QuickBoot.mode=") ||
+			strings.HasPrefix(l, "snapshot.present=") ||
+			strings.HasPrefix(l, "fastboot.") ||
+			strings.HasPrefix(l, "disk.dataPartition.") ||
+			strings.HasPrefix(l, "userdata.useQcow2=") ||
+			strings.HasPrefix(l, "firstboot.") {
+			continue
+		}
+		out = append(out, l)
+	}
+	out = append(out, "QuickBoot.mode=disabled")
+	out = append(out, "snapshot.present=false")
+	out = append(out, "fastboot.forceColdBoot=yes")
+	out = append(out, "userdata.useQcow2=yes")
+	return []byte(strings.Join(out, "\n"))
+}
+
+func goldenFingerprint(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+
+	hasher := sha256.New()
+	if info.IsDir() {
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return "", err
+		}
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].Name() < entries[j].Name()
+		})
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			st, err := entry.Info()
+			if err != nil {
+				return "", err
+			}
+			fmt.Fprintf(hasher, "%s:%d:%d;", entry.Name(), st.Size(), st.ModTime().UnixNano())
+		}
+	} else {
+		fmt.Fprintf(hasher, "%s:%d:%d", filepath.Base(path), info.Size(), info.ModTime().UnixNano())
+	}
+
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func cloneMatchesFingerprint(cloneDir, fingerprint string) (bool, error) {
+	stat, err := os.Stat(cloneDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !stat.IsDir() {
+		return false, fmt.Errorf("clone name conflict: %s is not a directory", cloneDir)
+	}
+	data, err := os.ReadFile(filepath.Join(cloneDir, cloneFingerprintFilename))
+	if err != nil {
+		return false, fmt.Errorf("clone name conflict: fingerprint missing")
+	}
+	if strings.TrimSpace(string(data)) == fingerprint {
+		return true, nil
+	}
+	return false, fmt.Errorf("clone name conflict: golden image mismatch")
+}
+
+func writeCloneFingerprint(cloneDir, fingerprint string) error {
+	return os.WriteFile(filepath.Join(cloneDir, cloneFingerprintFilename), []byte(fingerprint), 0o644)
+}
+
+func isCloneDir(path string) bool {
+	_, err := os.Stat(filepath.Join(path, cloneFingerprintFilename))
+	return err == nil
+}
+
+// emulatorLaunchArgs builds the emulator argv, honoring the configured GPU
+// backend (Metal via "host" on macOS) and headless/windowed mode.
+func emulatorLaunchArgs(env Env, name string, port int) []string {
+	args := []string{"-avd", name}
+	if port > 0 {
+		args = append(args, "-port", fmt.Sprint(port))
+	}
+	if !env.Windowed {
+		args = append(args, "-no-window")
+	}
+	args = append(args,
+		"-no-boot-anim",
+		"-no-snapshot",
+		"-no-snapshot-load",
+		"-no-snapshot-save",
+		"-skip-adb-auth",
+		"-no-metrics",
+		"-no-location-ui",
+		"-no-audio",
+	)
+	// A read-only system image is only required for the shared headless
+	// golden-image workflow; a windowed or explicitly writable instance must
+	// be writable so configuration/APK installs persist.
+	if !env.Windowed && !env.Writable {
+		args = append(args, "-read-only")
+	}
+	args = append(args, "-gpu", env.gpu(), "-logcat", "*:S")
+	return args
+}
+
+func StartEmulator(env Env, name string, extraArgs ...string) (*exec.Cmd, error) {
+	_, span := startSpan(
+		env,
+		"avd.StartEmulator",
+		attribute.String("name", name),
+	)
+	defer span.End()
+	logEvent(env, "emulator start requested", "name", name)
+	args := emulatorLaunchArgs(env, name, 0)
+
+	args = append(args, extraArgs...)
+	cmd := commandWithEnv([]string{"QEMU_FILE_LOCKING=off", "ADB_VENDOR_KEYS=/dev/null"}, env.Emulator, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.Stderr = newLineLogWriterWithMessage(env, "emulator stderr", "name", name, "stream", "stderr")
+	if err := cmd.Start(); err != nil {
+		recordSpanError(span, err)
+		logEvent(env, "emulator start failed", "name", name, "error", err)
+		return nil, fmt.Errorf("emulator start: %w", err)
+	}
+	span.SetAttributes(attribute.Int("pid", cmd.Process.Pid))
+	logEvent(env, "emulator started", "name", name, "pid", cmd.Process.Pid)
+	return cmd, nil
+}
+
+func GuessEmulatorSerial(env Env) (string, error) {
+	out, _, _ := runCommandOutputWithEnv(env.Context, nil, nil, env.ADB, "devices")
+	for _, line := range strings.Split(out, "\n") {
+		f := parseADBDeviceLine(line)
+		if len(f) >= 2 && strings.HasPrefix(f[0], "emulator-") && f[1] == "device" {
+			return f[0], nil
+		}
+	}
+	return "", errors.New("no emulator device found")
+}
+
+func WaitForBoot(env Env, serial string, timeout time.Duration) error {
+	return WaitForBootWithProgress(env, serial, timeout, nil)
+}
+
+func WaitForBootWithProgress(
+	env Env,
+	serial string,
+	timeout time.Duration,
+	progress BootProgressFunc,
+) error {
+	_, span := startSpan(
+		env,
+		"avd.WaitForBoot",
+		attribute.String("serial", serial),
+		attribute.String("timeout", timeout.String()),
+	)
+	defer span.End()
+
+	ctx := env.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	start := time.Now()
+	deadline := start.Add(timeout)
+	logEvent(env, "emulator boot wait started", "serial", serial, "timeout", timeout.String())
+
+	reportProgress := func(status string) {
+		if progress == nil {
+			return
+		}
+		progress(status, time.Since(start))
+	}
+
+	reportProgress("waiting_adb")
+	waitErrCh := make(chan error, 1)
+	waitForDeviceTimeout := timeout
+	minWaitForDeviceTimeout := 2 * time.Minute
+	if waitForDeviceTimeout <= 0 {
+		waitForDeviceTimeout = minWaitForDeviceTimeout
+	} else if waitForDeviceTimeout < minWaitForDeviceTimeout {
+		waitForDeviceTimeout = minWaitForDeviceTimeout
+	}
+	waitCtx, waitCancel := context.WithTimeout(ctx, waitForDeviceTimeout)
+	defer waitCancel()
+	go func() {
+		waitErrCh <- runWithContext(waitCtx, env, env.ADB, "wait-for-device")
+	}()
+
+	nextProgress := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case err := <-waitErrCh:
+			if err != nil {
+				recordSpanError(span, err)
+				return err
+			}
+			goto checkBoot
+		default:
+		}
+
+		if ctx.Err() != nil {
+			recordSpanError(span, ctx.Err())
+			return ctx.Err()
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		if time.Now().After(nextProgress) {
+			reportProgress("waiting_adb")
+			nextProgress = time.Now().Add(5 * time.Second)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+checkBoot:
+	reportProgress("checking_bootanim")
+	nextProgress = time.Now().Add(5 * time.Second)
+
+	lastError := ""
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			recordSpanError(span, ctx.Err())
+			return ctx.Err()
+		}
+
+		out, errOut, err := runCommandOutputWithEnv(
+			ctx,
+			nil,
+			nil,
+			env.ADB,
+			"-s",
+			serial,
+			"shell",
+			"getprop",
+			"sys.boot_completed",
+		)
+		bootCompleted := strings.TrimSpace(out)
+		if bootCompleted == "1" {
+			time.Sleep(2 * time.Second)
+			span.SetAttributes(attribute.Bool("boot_completed", true))
+			reportProgress("boot_complete")
+			logEvent(
+				env,
+				"emulator boot completed",
+				"serial",
+				serial,
+				"duration",
+				time.Since(start).String(),
+			)
+			return nil
+		}
+
+		if err != nil {
+			lastError = errOut
+			if lastError == "" {
+				lastError = err.Error()
+			}
+		}
+
+		if time.Now().After(nextProgress) {
+			reportProgress("checking_bootanim")
+			nextProgress = time.Now().Add(5 * time.Second)
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	errMsg := fmt.Sprintf("boot timeout after %s (adb could not confirm boot completion)", timeout)
+	if lastError != "" {
+		errMsg += fmt.Sprintf("\nLast ADB error: %s", strings.TrimSpace(lastError))
+	}
+	errMsg += fmt.Sprintf("\nHint: Check if emulator is still running and adb can see it: adb devices")
+	errMsg += fmt.Sprintf("\nNote: The emulator may have booted successfully but ADB lost connection.")
+
+	logEvent(
+		env,
+		"wait for boot timeout",
+		"serial",
+		serial,
+		"timeout",
+		timeout.String(),
+		"adb_error",
+		strings.TrimSpace(lastError),
+	)
+	recordSpanError(span, fmt.Errorf("boot timeout after %s", timeout))
+	return fmt.Errorf("%s", errMsg)
+}
+
+func KillEmulator(env Env, serial string) {
+	_ = run(env, env.ADB, "-s", serial, "emu", "kill")
+	time.Sleep(1 * time.Second)
+}
+
+func PrewarmGolden(env Env, name, dest string, extra time.Duration, bootTimeout time.Duration) (string, int64, error) {
+	// Restart ADB server to clear stale state
+	_ = run(env, env.ADB, "kill-server")
+	time.Sleep(1 * time.Second)
+	ensureADB(env)
+
+	// Find a free port dynamically to avoid conflicts
+	port, err := FindFreeEvenPortWithEnv(env, 5580, 5800)
+	if err != nil {
+		return "", 0, fmt.Errorf("no free port available for prewarming: %w", err)
+	}
+	cmd, serial, logPath, err := StartEmulatorOnPort(env, name, port)
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() {
+		if cmd != nil && cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}()
+
+	// Wait until adb sees that specific emulator serial
+	if err := waitForEmulatorSerial(env, serial, 60*time.Second); err != nil {
+		return "", 0, fmt.Errorf("ADB failed to detect emulator serial %s: %w\nEmulator log: %s\nNote: The emulator may still be starting. Check the log file for details.", serial, err, logPath)
+	}
+
+	// Now wait for Android to finish booting
+	if err := WaitForBoot(env, serial, bootTimeout); err != nil {
+		// Check if userdata was created (indicates boot likely succeeded)
+		avdPath := filepath.Join(env.AVDHome, name+".avd")
+		userdata1 := filepath.Join(avdPath, "userdata-qemu.img.qcow2")
+		userdata2 := filepath.Join(avdPath, "userdata-qemu.img")
+		if st, statErr := os.Stat(userdata1); statErr == nil && st.Size() > 1024*1024 {
+			KillEmulator(env, serial)
+			return SaveGolden(env, name, dest)
+		}
+		if st, statErr := os.Stat(userdata2); statErr == nil && st.Size() > 1024*1024 {
+			KillEmulator(env, serial)
+			return SaveGolden(env, name, dest)
+		}
+		return "", 0, fmt.Errorf("%w\nEmulator log: %s", err, logPath)
+	}
+
+	// Disable lockscreen and complete setup
+	_ = run(env, env.ADB, "-s", serial, "shell", "settings", "put", "global", "device_provisioned", "1")
+	_ = run(env, env.ADB, "-s", serial, "shell", "settings", "put", "secure", "user_setup_complete", "1")
+	_ = run(env, env.ADB, "-s", serial, "shell", "locksettings", "set-disabled", "true")
+	_ = run(env, env.ADB, "-s", serial, "shell", "wm", "dismiss-keyguard")
+	_ = run(env, env.ADB, "-s", serial, "shell", "input", "keyevent", "82") // MENU key to wake/unlock
+
+	if extra > 0 {
+		time.Sleep(extra)
+	}
+
+	KillEmulator(env, serial)
+	return SaveGolden(env, name, dest)
+}
+
+func RunAVD(env Env, name string, extraArgs ...string) (string, error) {
+	_, span := startSpan(
+		env,
+		"avd.RunAVD",
+		attribute.String("name", name),
+	)
+	defer span.End()
+	ensureADB(env)
+	port, err := FindFreeEvenPortWithEnv(env, 5580, 5800)
+	if err != nil {
+		recordSpanError(span, err)
+		return "", err
+	}
+	_, serial, logPath, err := StartEmulatorOnPort(env, name, port, extraArgs...)
+	if err != nil {
+		recordSpanError(span, err)
+		return "", err
+	}
+
+	// wait up to 60s for adb to see this exact serial
+	if err := waitForEmulatorSerial(env, serial, 60*time.Second); err != nil {
+		recordSpanError(span, err)
+		return "", fmt.Errorf("%w\nemulator log: %s", err, logPath)
+	}
+	span.SetAttributes(attribute.String("serial", serial))
+	fmt.Printf("Started %s on %s (log: %s)\n", name, serial, logPath)
+	return serial, nil
+}
+
+func BakeAPK(env Env, base, name, golden string, apks []string, timeout time.Duration) (string, int64, error) {
+	if _, err := CloneFromGolden(env, base, name, golden); err != nil {
+		return "", 0, err
+	}
+	cmd, err := StartEmulator(env, name)
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() {
+		if cmd != nil && cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}()
+
+	serial, err := GuessEmulatorSerial(env)
+	if err != nil {
+		return "", 0, err
+	}
+	if err := WaitForBoot(env, serial, timeout); err != nil {
+		return "", 0, err
+	}
+	for _, apk := range apks {
+		if err := run(env, env.ADB, "-s", serial, "install", "-r", apk); err != nil {
+			return "", 0, fmt.Errorf("install %s: %w", apk, err)
+		}
+	}
+	KillEmulator(env, serial)
+
+	// Return overlay path and size
+	cloneDir := filepath.Join(env.AVDHome, name+".avd")
+	ud := filepath.Join(cloneDir, "userdata-qemu.img.qcow2")
+	if _, err := os.Stat(ud); err != nil {
+		ud = filepath.Join(cloneDir, "userdata-qemu.img")
+	}
+	st, _ := os.Stat(ud)
+	return ud, st.Size(), nil
+}
+
+func Delete(env Env, name string) error {
+	if name == "" {
+		return errors.New("empty name")
+	}
+	avdDir := filepath.Join(env.AVDHome, name+".avd")
+	ini := filepath.Join(env.AVDHome, name+".ini")
+
+	if _, err := os.Stat(avdDir); err != nil {
+		if os.IsNotExist(err) {
+			if _, iniErr := os.Stat(ini); os.IsNotExist(iniErr) {
+				return nil
+			}
+		} else {
+			return err
+		}
+	}
+
+	procs, err := ListRunning(env)
+	if err != nil {
+		return err
+	}
+	for _, proc := range procs {
+		if proc.Name == name {
+			return fmt.Errorf("cannot delete running AVD %s; stop it first", name)
+		}
+	}
+
+	_ = os.RemoveAll(avdDir)
+	_ = os.Remove(ini)
+	return nil
+}
+
+func infoOf(env Env, name string) (Info, error) {
+	dir := filepath.Join(env.AVDHome, name+".avd")
+	ud := filepath.Join(dir, "userdata-qemu.img.qcow2")
+	if _, err := os.Stat(ud); err != nil {
+		alt := filepath.Join(dir, "userdata-qemu.img")
+		if _, err2 := os.Stat(alt); err2 == nil {
+			ud = alt
+		} else {
+			ud = filepath.Join(dir, "userdata.img")
+		}
+	}
+	var sz int64
+	if st, err := os.Stat(ud); err == nil {
+		sz = st.Size()
+	}
+	return Info{Name: name, Path: dir, Userdata: ud, SizeBytes: sz}, nil
+}
+
+// ensureADB starts adb server (idempotent).
+func ensureADB(env Env) { _ = run(env, env.ADB, "start-server") }
+
+// StartEmulatorOnPort starts emulator with a fixed port and returns (*exec.Cmd, serial, logPath).
+func StartEmulatorOnPort(env Env, name string, port int, extraArgs ...string) (*exec.Cmd, string, string, error) {
+	_, span := startSpan(
+		env,
+		"avd.StartEmulatorOnPort",
+		attribute.String("name", name),
+		attribute.Int("port", port),
+	)
+	defer span.End()
+	logEvent(env, "emulator start requested", "name", name, "port", port)
+	// emulator uses a pair: <port> and <port+1>; must be even
+	if port%2 != 0 {
+		err := fmt.Errorf("port %d is odd; emulator requires even port numbers (uses port and port+1)", port)
+		recordSpanError(span, err)
+		return nil, "", "", err
+	}
+	if port < 5554 || port > 5800 {
+		err := fmt.Errorf("port %d out of valid range (5554-5800)", port)
+		recordSpanError(span, err)
+		return nil, "", "", err
+	}
+
+	// Check if port is already in use (with retry for TIME_WAIT sockets)
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if isPortPairFree(env, port) {
+			break
+		}
+		if attempt < maxRetries-1 {
+			time.Sleep(2 * time.Second)
+		} else {
+			err := fmt.Errorf(
+				"port %d or %d still in use after %d retries (may be in TIME_WAIT state)",
+				port,
+				port+1,
+				maxRetries,
+			)
+			recordSpanError(span, err)
+			return nil, "", "", err
+		}
+	}
+
+	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("emulator-%s-%d.log", name, port))
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		recordSpanError(span, err)
+		return nil, "", "", fmt.Errorf("open log: %w", err)
+	}
+
+	args := emulatorLaunchArgs(env, name, port)
+
+	args = append(args, extraArgs...)
+	cmd := commandWithEnv([]string{"QEMU_FILE_LOCKING=off", "ADB_VENDOR_KEYS=/dev/null"}, env.Emulator, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	// For detached emulators, write directly to a file descriptor instead of parent-owned
+	// pipes (e.g. io.MultiWriter), otherwise the child can die when avdctl exits.
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		recordSpanError(span, err)
+		logEvent(
+			env,
+			"emulator start failed",
+			"name",
+			name,
+			"port",
+			port,
+			"error",
+			err,
+			"log_path",
+			logPath,
+		)
+		return nil, "", "", fmt.Errorf("emulator start: %w", err)
+	}
+	_ = logFile.Close()
+	serial := fmt.Sprintf("emulator-%d", port)
+	span.SetAttributes(
+		attribute.String("serial", serial),
+		attribute.Int("pid", cmd.Process.Pid),
+		attribute.String("log_path", logPath),
+	)
+	logEvent(
+		env,
+		"emulator started",
+		"name",
+		name,
+		"port",
+		port,
+		"serial",
+		serial,
+		"pid",
+		cmd.Process.Pid,
+		"log_path",
+		logPath,
+	)
+	return cmd, serial, logPath, nil
+}
+
+// waitForEmulatorSerial polls adb devices for a specific serial.
+func waitForEmulatorSerial(env Env, serial string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		out, _, _ := runCommandOutputWithEnv(env.Context, nil, nil, env.ADB, "devices")
+		for _, line := range strings.Split(out, "\n") {
+			f := parseADBDeviceLine(line)
+			if len(f) >= 2 && f[0] == serial {
+				return nil // seen (status can be 'device' or 'offline'; WaitForBoot will handle readiness)
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("device %s not seen within %s", serial, timeout)
+}
+
+func isSerialVisible(env Env, serial string) (bool, error) {
+	out, _, err := runCommandOutputWithEnv(env.Context, nil, nil, env.ADB, "devices")
+	if err != nil {
+		return false, fmt.Errorf("adb devices failed: %w", err)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		fields := parseADBDeviceLine(line)
+		if len(fields) >= 2 && fields[0] == serial {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func parseADBDeviceLine(line string) []string {
+	line = strings.TrimSpace(strings.ReplaceAll(line, `\t`, "\t"))
+	if line == "" || strings.HasPrefix(line, "List of devices attached") {
+		return nil
+	}
+	return strings.Fields(line)
+}
+
+// FindFreeEvenPort returns the first free even port in [start, end) (emulator uses port and port+1).
+func FindFreeEvenPort(start, end int) (int, error) {
+	return FindFreeEvenPortWithEnv(Env{}, start, end)
+}
+
+// FindFreeEvenPortWithEnv returns the first free even port in [start, end).
+func FindFreeEvenPortWithEnv(_ Env, start, end int) (int, error) {
+	if start%2 != 0 {
+		start++
+	}
+	for p := start; p < end; p += 2 {
+		l1, err1 := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err1 != nil {
+			continue
+		}
+		l2, err2 := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p+1))
+		if err2 != nil {
+			_ = l1.Close()
+			continue
+		}
+		_ = l1.Close()
+		_ = l2.Close()
+		return p, nil
+	}
+	return 0, fmt.Errorf("no free even port found in %d..%d", start, end)
+}
+
+// GetAVDNameFromSerial asks the emulator console for the AVD name.
+func GetAVDNameFromSerial(env Env, serial string) (string, error) {
+	out, _, _ := runCommandOutputWithEnv(env.Context, nil, nil, env.ADB, "-s", serial, "emu", "avd", "name")
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) == 0 {
+		return "", nil
+	}
+	if strings.TrimSpace(lines[len(lines)-1]) == "OK" && len(lines) > 1 {
+		lines = lines[:len(lines)-1]
+	}
+	name := strings.TrimSpace(lines[0])
+	return name, nil
+}
+
+type ProcInfo struct {
+	Serial string `json:"serial"`
+	Name   string `json:"name"`
+	Port   int    `json:"port"`
+	PID    int    `json:"pid"`
+	Booted bool   `json:"booted"`
+}
+
+type CleanupReport struct {
+	OrphanedProcesses []ProcInfo `json:"orphaned_processes"`
+	OrphanedAVDs      []Info     `json:"orphaned_avds"`
+}
+
+func ListRunning(env Env) ([]ProcInfo, error) {
+	_, span := startSpan(env, "avd.ListRunning")
+	defer span.End()
+	ensureADB(env)
+
+	var procs []ProcInfo
+	seen := make(map[int]bool)
+
+	// Strategy 1: Get emulators from adb devices (may not show all if just started)
+	out, _, _ := runCommandOutputWithEnv(env.Context, nil, nil, env.ADB, "devices")
+	for _, line := range strings.Split(out, "\n") {
+		f := parseADBDeviceLine(line)
+		if len(f) >= 2 && strings.HasPrefix(f[0], "emulator-") {
+			serial := f[0]
+			port := 0
+			if n, err := strconv.Atoi(strings.TrimPrefix(serial, "emulator-")); err == nil {
+				port = n
+			}
+			if port == 0 {
+				continue
+			}
+			seen[port] = true
+
+			// Try to get name from adb, fallback to process cmdline
+			name, _ := GetAVDNameFromSerial(env, serial)
+			pid := findEmulatorPID(port)
+			if pid > 0 && isZombieProcess(pid) {
+				continue
+			}
+			if name == "" && pid > 0 {
+				name = findEmulatorNameFromPID(pid)
+			}
+
+			boot := false
+			// quick boot check using explicit serial
+			bootOut, _, _ := runCommandOutputWithEnv(
+				env.Context,
+				nil,
+				nil,
+				env.ADB,
+				"-s",
+				serial,
+				"shell",
+				"getprop",
+				"sys.boot_completed",
+			)
+			if strings.TrimSpace(bootOut) == "1" {
+				boot = true
+			}
+			procs = append(procs, ProcInfo{Serial: serial, Name: name, Port: port, PID: pid, Booted: boot})
+		}
+	}
+
+	// Strategy 2: Scan for running qemu processes that adb missed
+	// This catches emulators that just started and haven't registered with adb yet
+	// Scan the full range that emulators typically use
+	for port := 5554; port <= 5800; port += 2 {
+		if seen[port] {
+			continue
+		}
+		pid := findEmulatorPID(port)
+		if pid > 0 {
+			if isZombieProcess(pid) {
+				continue
+			}
+			// Found a running emulator on this port
+			serial := fmt.Sprintf("emulator-%d", port)
+			// Try to get name from adb, fallback to process cmdline
+			name, _ := GetAVDNameFromSerial(env, serial)
+			if name == "" {
+				name = findEmulatorNameFromPID(pid)
+			}
+
+			// Try to check boot status
+			boot := false
+			bootOut, _, bootErr := runCommandOutputWithEnv(
+				env.Context,
+				nil,
+				nil,
+				env.ADB,
+				"-s",
+				serial,
+				"shell",
+				"getprop",
+				"sys.boot_completed",
+			)
+			if bootErr == nil && strings.TrimSpace(bootOut) == "1" {
+				boot = true
+			}
+
+			procs = append(procs, ProcInfo{Serial: serial, Name: name, Port: port, PID: pid, Booted: boot})
+		}
+	}
+
+	return procs, nil
+}
+
+func CleanupOrphans(env Env, force bool) (CleanupReport, error) {
+	_, span := startSpan(
+		env,
+		"avd.CleanupOrphans",
+		attribute.Bool("force", force),
+	)
+	defer span.End()
+
+	report := CleanupReport{}
+	avds, err := List(env)
+	if err != nil {
+		recordSpanError(span, err)
+		return report, err
+	}
+	procs, err := ListRunning(env)
+	if err != nil {
+		recordSpanError(span, err)
+		return report, err
+	}
+
+	avdByName := make(map[string]Info, len(avds))
+	for _, info := range avds {
+		avdByName[info.Name] = info
+	}
+	runningByName := make(map[string]ProcInfo, len(procs))
+	for _, proc := range procs {
+		if proc.Name != "" {
+			runningByName[proc.Name] = proc
+		}
+	}
+
+	for _, proc := range procs {
+		if proc.Name == "" {
+			report.OrphanedProcesses = append(report.OrphanedProcesses, proc)
+			continue
+		}
+		if _, ok := avdByName[proc.Name]; !ok {
+			report.OrphanedProcesses = append(report.OrphanedProcesses, proc)
+		}
+	}
+
+	for _, info := range avds {
+		if !isCloneDir(info.Path) {
+			continue
+		}
+		if _, ok := runningByName[info.Name]; ok {
+			continue
+		}
+		report.OrphanedAVDs = append(report.OrphanedAVDs, info)
+	}
+
+	if force {
+		for _, proc := range report.OrphanedProcesses {
+			if err := StopBySerial(env, proc.Serial); err != nil {
+				logEvent(env, "orphan process stop failed", "serial", proc.Serial, "error", err)
+			}
+		}
+		for _, info := range report.OrphanedAVDs {
+			if err := Delete(env, info.Name); err != nil {
+				logEvent(env, "orphan avd delete failed", "name", info.Name, "error", err)
+			}
+		}
+	}
+
+	if len(report.OrphanedProcesses) > 0 || len(report.OrphanedAVDs) > 0 {
+		logEvent(
+			env,
+			"orphan cleanup scan completed",
+			"orphaned_processes",
+			len(report.OrphanedProcesses),
+			"orphaned_avds",
+			len(report.OrphanedAVDs),
+			"force",
+			force,
+		)
+	}
+
+	return report, nil
+}
+
+// findEmulatorPID best-effort: parse `ps` for qemu-system or emulator on the
+// given port. Uses /proc on Linux and falls back to a portable `ps` scan so
+// that macOS/Darwin hosts also resolve the emulator PID.
+func findEmulatorPID(port int) int {
+	// Linux fast path: look for "-port <port>" in /proc/<pid>/cmdline.
+	entries, _ := filepath.Glob("/proc/[0-9]*/cmdline")
+	for _, p := range entries {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		// Must contain both "-port <port>" AND "qemu-system" or "emulator" (not docker-proxy!)
+		if bytes.Contains(b, []byte(fmt.Sprintf("-port%c%d", 0, port))) &&
+			(bytes.Contains(b, []byte("qemu-system")) || bytes.Contains(b, []byte("emulator"))) {
+			// extract PID from path /proc/<pid>/cmdline
+			base := filepath.Base(filepath.Dir(p))
+			if n, err := strconv.Atoi(base); err == nil {
+				// Verify this PID actually exists and is running
+				if _, statErr := os.Stat(filepath.Join("/proc", base, "stat")); statErr == nil {
+					return n
+				}
+			}
+		}
+	}
+	return findEmulatorPIDFromPS(port)
+}
+
+// findEmulatorPIDFromPS is a portable fallback (macOS, BSD, Linux) that
+// resolves the emulator PID for a port from a single, briefly-cached `ps`
+// snapshot (avoiding one process spawn per probed port).
+func findEmulatorPIDFromPS(port int) int {
+	return emulatorPIDMap()[port]
+}
+
+var (
+	emuPIDCacheMu sync.Mutex
+	emuPIDCacheAt time.Time
+	emuPIDCache   map[int]int
+)
+
+// emulatorPIDMap scans `ps` once and maps emulator console ports to PIDs. The
+// snapshot is cached for a second so a full port sweep costs a single spawn.
+func emulatorPIDMap() map[int]int {
+	emuPIDCacheMu.Lock()
+	defer emuPIDCacheMu.Unlock()
+	if emuPIDCache != nil && time.Since(emuPIDCacheAt) < time.Second {
+		return emuPIDCache
+	}
+	m := make(map[int]int)
+	out, err := exec.Command("ps", "-Ao", "pid=,command=").Output()
+	if err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			sep := strings.IndexAny(line, " \t")
+			if sep <= 0 {
+				continue
+			}
+			cmdline := line[sep+1:]
+			if !strings.Contains(cmdline, "qemu-system") && !strings.Contains(cmdline, "emulator") {
+				continue
+			}
+			if port := portFromCmdline(cmdline); port > 0 {
+				if pid, convErr := strconv.Atoi(line[:sep]); convErr == nil {
+					m[port] = pid
+				}
+			}
+		}
+	}
+	emuPIDCache = m
+	emuPIDCacheAt = time.Now()
+	return m
+}
+
+func portFromCmdline(cmdline string) int {
+	fields := strings.Fields(cmdline)
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] == "-port" {
+			if n, err := strconv.Atoi(fields[i+1]); err == nil {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+func isZombieProcess(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	statusPath := filepath.Join("/proc", strconv.Itoa(pid), "status")
+	data, err := os.ReadFile(statusPath)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "State:") {
+			return strings.Contains(line, "Z")
+		}
+	}
+	return false
+}
+
+type qemuProcess struct {
+	PID       int
+	ParentPID int
+	State     string
+	Cmdline   string
+}
+
+func listQemuProcesses() ([]qemuProcess, error) {
+	entries, err := filepath.Glob("/proc/[0-9]*/cmdline")
+	if err != nil {
+		return nil, err
+	}
+
+	var procs []qemuProcess
+	for _, entry := range entries {
+		b, err := os.ReadFile(entry)
+		if err != nil || len(b) == 0 {
+			continue
+		}
+		if !bytes.Contains(b, []byte("qemu-system")) && !bytes.Contains(b, []byte("emulator")) {
+			continue
+		}
+		if bytes.Contains(b, []byte("docker-proxy")) {
+			continue
+		}
+
+		base := filepath.Base(filepath.Dir(entry))
+		pid, err := strconv.Atoi(base)
+		if err != nil || pid <= 0 {
+			continue
+		}
+
+		state, ppid, err := readProcessState(pid)
+		if err != nil {
+			continue
+		}
+		cmdline := strings.ReplaceAll(string(b), "\x00", " ")
+		procs = append(procs, qemuProcess{
+			PID:       pid,
+			ParentPID: ppid,
+			State:     state,
+			Cmdline:   strings.TrimSpace(cmdline),
+		})
+	}
+
+	return procs, nil
+}
+
+func readProcessState(pid int) (string, int, error) {
+	statPath := filepath.Join("/proc", strconv.Itoa(pid), "stat")
+	stat, err := os.ReadFile(statPath)
+	if err != nil {
+		return "", 0, err
+	}
+	data := string(stat)
+	rparen := strings.LastIndex(data, ")")
+	if rparen == -1 || rparen+2 >= len(data) {
+		return "", 0, fmt.Errorf("invalid stat format for pid %d", pid)
+	}
+	fields := strings.Fields(data[rparen+2:])
+	if len(fields) < 2 {
+		return "", 0, fmt.Errorf("invalid stat format for pid %d", pid)
+	}
+	state := fields[0]
+	ppid, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return "", 0, err
+	}
+	return state, ppid, nil
+}
+
+// KillAllEmulatorsReport reports the results of the stop-all operation.
+type KillAllEmulatorsReport struct {
+	Passes        int   // Number of passes executed
+	KilledPIDs    []int // Emulator PIDs that were sent SIGTERM (gracefully terminated)
+	KilledParents []int // Parent PIDs that were sent SIGKILL (for zombie cleanup)
+	Remaining     int   // Remaining emulator processes after all passes
+}
+
+// KillAllEmulators gracefully stops all emulator processes using SIGTERM, retrying until none remain.
+func KillAllEmulators(env Env, maxPasses int, delay time.Duration) (KillAllEmulatorsReport, error) {
+
+	if maxPasses <= 0 {
+		maxPasses = 5
+	}
+
+	if delay <= 0 {
+		delay = 500 * time.Millisecond
+	}
+
+	_, span := startSpan(env, "avd.KillAllEmulators",
+		attribute.Int("max_passes", maxPasses),
+		attribute.String("delay", delay.String()),
+	)
+	defer span.End()
+
+	report := KillAllEmulatorsReport{}
+	killed := make(map[int]struct{})
+	killedParents := make(map[int]struct{})
+	passesRun := 0
+	var remainingProcs []qemuProcess
+
+	for pass := 0; pass < maxPasses; pass++ {
+		procs, err := listQemuProcesses()
+		if err != nil {
+			recordSpanError(span, err)
+			return report, err
+		}
+		if len(procs) == 0 {
+			remainingProcs = procs
+			break
+		}
+
+		passesRun++
+		for _, proc := range procs {
+			if proc.State == "Z" && proc.ParentPID > 1 {
+				if err := syscall.Kill(proc.ParentPID, syscall.SIGKILL); err == nil {
+					killedParents[proc.ParentPID] = struct{}{}
+				}
+				continue
+			}
+			// Use SIGTERM for graceful shutdown instead of SIGKILL
+			if err := syscall.Kill(proc.PID, syscall.SIGTERM); err == nil {
+				killed[proc.PID] = struct{}{}
+			}
+		}
+
+		if pass < maxPasses-1 {
+			time.Sleep(delay)
+		}
+	}
+
+	if remainingProcs == nil {
+		var err error
+		remainingProcs, err = listQemuProcesses()
+		if err != nil {
+			recordSpanError(span, err)
+			return report, err
+		}
+	}
+	report.Passes = passesRun
+	report.Remaining = len(remainingProcs)
+	for pid := range killed {
+		report.KilledPIDs = append(report.KilledPIDs, pid)
+	}
+	for pid := range killedParents {
+		report.KilledParents = append(report.KilledParents, pid)
+	}
+	sort.Ints(report.KilledPIDs)
+	sort.Ints(report.KilledParents)
+	if report.Remaining > 0 {
+		logEvent(env, "kill all emulators incomplete", "remaining", report.Remaining, "passes", report.Passes)
+	} else {
+		logEvent(env, "kill all emulators completed", "passes", report.Passes)
+	}
+	return report, nil
+}
+
+// findEmulatorNameFromPID extracts AVD name from process cmdline
+func findEmulatorNameFromPID(pid int) string {
+	if pid == 0 {
+		return ""
+	}
+	cmdlinePath := filepath.Join("/proc", strconv.Itoa(pid), "cmdline")
+	b, err := os.ReadFile(cmdlinePath)
+	if err != nil {
+		return ""
+	}
+	// cmdline is null-separated: [emulator, -avd, name, -port, ...]
+	parts := bytes.Split(b, []byte{0})
+	for i, part := range parts {
+		if string(part) == "-avd" && i+1 < len(parts) {
+			return string(parts[i+1])
+		}
+	}
+	return ""
+}
+
+// isPortFree checks if a TCP port is available
+func isPortFree(port int) bool {
+	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return false
+	}
+	_ = l.Close()
+	return true
+}
+
+func isPortPairFree(_ Env, port int) bool {
+	return isPortFree(port) && isPortFree(port+1)
+}
+
+// createSDCard creates an sdcard.img file based on config.ini sdcard.size setting
+func createSDCard(env Env, avdDir, configPath string) error {
+	// Read config.ini to get sdcard.size
+	cfgBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+
+	// Parse sdcard.size (e.g., "512 MB", "512M", "1G")
+	var sdcardSize string
+	for _, line := range strings.Split(string(cfgBytes), "\n") {
+		if strings.HasPrefix(line, "sdcard.size=") {
+			sdcardSize = strings.TrimSpace(strings.TrimPrefix(line, "sdcard.size="))
+			break
+		}
+	}
+
+	// Default to 512MB if not specified
+	if sdcardSize == "" {
+		sdcardSize = "512M"
+	}
+
+	// Normalize size format: qemu-img accepts M/G suffixes, not MB/GB.
+	// "512 MB" -> "512M", "1 GB" -> "1G"
+	sdcardSize = normalizeSDCardSize(sdcardSize)
+
+	// Ensure minimum 512M (mksdcard requires at least 9M)
+	if !strings.Contains(sdcardSize, "M") && !strings.Contains(sdcardSize, "G") {
+		sdcardSize = "512M"
+	}
+
+	// Create sdcard using mksdcard tool
+	sdcardPath := filepath.Join(avdDir, "sdcard.img")
+	mksdcard := filepath.Join(env.SDKRoot, "emulator", "mksdcard")
+
+	// Try mksdcard first (preferred)
+	if _, err := os.Stat(mksdcard); err == nil {
+		if err := run(env, mksdcard, sdcardSize, sdcardPath); err != nil {
+			return fmt.Errorf("mksdcard failed: %w", err)
+		}
+		return nil
+	}
+
+	// Fallback: create empty file with qemu-img
+	return run(env, env.QemuImg, "create", "-f", "raw", sdcardPath, sdcardSize)
+}
+
+func normalizeSDCardSize(size string) string {
+	size = strings.ToUpper(strings.ReplaceAll(size, " ", ""))
+	size = strings.TrimSuffix(size, "IB")
+	if strings.HasSuffix(size, "MB") || strings.HasSuffix(size, "GB") {
+		size = strings.TrimSuffix(size, "B")
+	}
+	return size
+}
+
+// CustomizeStart prepares AVD for manual customization and starts GUI emulator without snapshots.
+// Returns path to emulator log file.
+func CustomizeStart(env Env, name string) (string, error) {
+	if name == "" {
+		return "", errors.New("empty name")
+	}
+	avdDir := filepath.Join(env.AVDHome, name+".avd")
+	cfg := filepath.Join(avdDir, "config.ini")
+	b, err := os.ReadFile(cfg)
+	if err != nil {
+		return "", fmt.Errorf("read config: %w", err)
+	}
+	if err := os.WriteFile(cfg, sanitizeConfigINI(b), 0o644); err != nil {
+		return "", fmt.Errorf("write config: %w", err)
+	}
+	_ = os.RemoveAll(filepath.Join(avdDir, "snapshots"))
+
+	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("emulator-%s-customize.log", name))
+	lf, err := os.Create(logPath)
+	if err != nil {
+		return "", fmt.Errorf("open log: %w", err)
+	}
+	args := []string{"-avd", name, "-no-snapshot-load", "-no-snapshot-save"}
+	cmd := commandWithEnv([]string{"QEMU_FILE_LOCKING=off"}, env.Emulator, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	// Keep the child independent from parent lifecycle: file-only stdio for detached launch.
+	cmd.Stdout = lf
+	cmd.Stderr = lf
+	if err := cmd.Start(); err != nil {
+		_ = lf.Close()
+		return "", fmt.Errorf("emulator start: %w", err)
+	}
+	_ = lf.Close()
+	return logPath, nil
+}
+
+// CustomizeFinish stops the emulator (if running) and exports userdata to a golden qcow2.
+func CustomizeFinish(env Env, name, dest string) (string, int64, error) {
+	if name == "" {
+		return "", 0, errors.New("empty name")
+	}
+	if procs, err := ListRunning(env); err == nil {
+		for _, p := range procs {
+			if p.Name == name {
+				KillEmulator(env, p.Serial)
+				time.Sleep(1 * time.Second)
+				break
+			}
+		}
+	}
+	if dest == "" {
+		dir := env.GoldenDir
+		_ = os.MkdirAll(dir, 0o755)
+		dest = filepath.Join(dir, fmt.Sprintf("%s-custom.qcow2", name))
+	}
+	return SaveGolden(env, name, dest)
+}
+
+// Stop by serial (clean). Falls back to SIGTERM if adb fails.
+func StopBySerial(env Env, serial string) error {
+	if !strings.HasPrefix(serial, "emulator-") {
+		return fmt.Errorf("invalid serial format: %s (expected emulator-XXXX)", serial)
+	}
+
+	// Extract port from serial
+	port := 0
+	if n, err := strconv.Atoi(strings.TrimPrefix(serial, "emulator-")); err == nil {
+		port = n
+	}
+	_, span := startSpan(
+		env,
+		"avd.StopBySerial",
+		attribute.String("serial", serial),
+		attribute.Int("port", port),
+	)
+	defer span.End()
+	logEvent(env, "emulator stop requested", "serial", serial, "port", port)
+
+	// Try graceful shutdown via adb first
+	_, errOut, adbErr := runCommandOutputWithEnv(env.Context, nil, nil, env.ADB, "-s", serial, "emu", "kill")
+	adbOutput := strings.TrimSpace(errOut)
+
+	serialGone := false
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		visible, err := isSerialVisible(env, serial)
+		if err == nil && !visible {
+			serialGone = true
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	pid := findEmulatorPID(port)
+	if pid == 0 {
+		if serialGone || adbErr == nil {
+			span.SetAttributes(attribute.Bool("stopped", true))
+			logEvent(env, "emulator stopped", "serial", serial, "port", port)
+			return nil
+		}
+		recordSpanError(span, adbErr)
+		return fmt.Errorf("failed to stop %s via adb: %w\nADB error: %s", serial, adbErr, adbOutput)
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		if adbErr != nil {
+			recordSpanError(span, adbErr)
+			return fmt.Errorf("failed to stop %s via adb: %w\nADB error: %s", serial, adbErr, adbOutput)
+		}
+		return nil
+	}
+
+	// ADB kill failed or didn't work, fallback to SIGTERM locally.
+	if killErr := proc.Signal(syscall.SIGTERM); killErr == nil {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if findEmulatorPID(port) == 0 {
+				span.SetAttributes(attribute.Bool("stopped", true))
+				logEvent(env, "emulator stopped", "serial", serial, "port", port, "pid", pid)
+				return nil
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		_ = proc.Kill()
+		span.SetAttributes(attribute.Bool("stopped", true))
+		logEvent(env, "emulator stopped", "serial", serial, "port", port, "pid", pid)
+		return nil
+	}
+
+	// If we got here, adb failed and we couldn't kill the process
+	if adbErr != nil {
+		recordSpanError(span, adbErr)
+		logEvent(env, "emulator stop failed", "serial", serial, "port", port, "pid", pid, "error", adbErr)
+		return fmt.Errorf("failed to stop %s via adb: %w\nADB error: %s\nAlso failed to kill PID %d",
+			serial, adbErr, adbOutput, pid)
+	}
+
+	return nil
+}
+
+// StopBluetooth disables Bluetooth and scanning to prevent "Bluetooth keeps stopping" errors
+func StopBluetooth(env Env, serial string) error {
+	if !strings.HasPrefix(serial, "emulator-") {
+		return fmt.Errorf("invalid serial format: %s (expected emulator-XXXX)", serial)
+	}
+
+	_, span := startSpan(
+		env,
+		"avd.StopBluetooth",
+		attribute.String("serial", serial),
+	)
+	defer span.End()
+	logEvent(env, "disabling bluetooth", "serial", serial)
+
+	// Execute each command to disable Bluetooth and scanning
+	commands := []struct {
+		desc     string
+		args     []string
+		required bool
+	}{
+		{"disable bluetooth service", []string{"-s", serial, "shell", "svc", "bluetooth", "disable"}, true},
+		{"disable bluetooth scanning", []string{"-s", serial, "shell", "settings", "put", "global", "bluetooth_scanning_enabled", "0"}, true},
+		{"disable wifi scanning", []string{"-s", serial, "shell", "settings", "put", "global", "wifi_scanning_enabled", "0"}, true},
+		// Some images use com.google.android.bluetooth while others still expose com.android.bluetooth.
+		// Force-stop is best-effort and intentionally non-fatal if the package does not exist.
+		{"force-stop com.google.android.bluetooth", []string{"-s", serial, "shell", "am", "force-stop", "com.google.android.bluetooth"}, false},
+		{"force-stop com.android.bluetooth", []string{"-s", serial, "shell", "am", "force-stop", "com.android.bluetooth"}, false},
+	}
+
+	for _, cmdDef := range commands {
+		_, errOut, err := runCommandOutputWithEnv(env.Context, nil, nil, env.ADB, cmdDef.args...)
+		if err != nil {
+			if cmdDef.required {
+				recordSpanError(span, err)
+				logEvent(env, "bluetooth disable command failed", "serial", serial, "command", cmdDef.desc, "error", err)
+				return fmt.Errorf("failed to %s: %w\nOutput: %s", cmdDef.desc, err, errOut)
+			}
+			logEvent(env, "optional bluetooth command failed", "serial", serial, "command", cmdDef.desc, "error", err)
+		}
+	}
+
+	logEvent(env, "bluetooth disabled successfully", "serial", serial)
+	return nil
+}
