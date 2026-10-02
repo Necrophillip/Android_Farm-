@@ -182,6 +182,29 @@
       <div class="apps-list" id="apps-list"></div>
     </div>
 
+    <div class="apps glass">
+      <div class="recorder-head">
+        <strong>🌎 Región / Red</strong>
+        <span class="muted" id="region-current"></span>
+      </div>
+      <div class="textrow">
+        <select id="region-state" class="macro-select"></select>
+        <button class="btn primary" id="region-apply">Aplicar</button>
+      </div>
+      <p class="hint">Localiza el contenedor (GPS + zona horaria + locale es-MX) para probar tu app por estado.</p>
+      <div class="textrow">
+        <select id="proxy-list" class="macro-select"></select>
+        <button class="btn ghost" id="proxy-use" title="Cargar en el campo">Usar</button>
+        <button class="btn ghost" id="proxy-del" title="Borrar de la libreta">🗑</button>
+      </div>
+      <div class="textrow">
+        <input id="region-proxy" placeholder="host:puerto (tu proxy)" autocomplete="off" />
+        <button class="btn primary" id="proxy-apply">Aplicar</button>
+        <button class="btn ghost" id="proxy-save" title="Guardar en la libreta">💾</button>
+      </div>
+      <p class="hint">Proxies <b>tuyos</b> (self-hosted o de pago). FarmUI no genera ni rota proxies.</p>
+    </div>
+
     <div class="keyrow">
       <button class="btn tile" data-key="3">⌂</button>
       <button class="btn tile" data-key="4">←</button>

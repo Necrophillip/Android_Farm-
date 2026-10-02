@@ -76,6 +76,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/instances/{name}/apks/{id}/install", s.handleInstallAPK)
 	s.mux.HandleFunc("DELETE /api/instances/{name}/packages/{pkg}", s.handleUninstallPackage)
 	s.mux.HandleFunc("POST /api/instances/{name}/packages/{pkg}/launch", s.handleLaunchPackage)
+	s.mux.HandleFunc("POST /api/instances/{name}/region", s.handleSetRegion)
+	s.mux.HandleFunc("POST /api/instances/{name}/proxy", s.handleSetProxy)
+	s.mux.HandleFunc("GET /api/regions", s.handleRegions)
+	s.mux.HandleFunc("GET /api/proxies", s.handleListProxies)
+	s.mux.HandleFunc("POST /api/proxies", s.handleAddProxy)
+	s.mux.HandleFunc("DELETE /api/proxies/{id}", s.handleDeleteProxy)
 }
 
 func (s *Server) handleSystem(w http.ResponseWriter, r *http.Request) {
@@ -450,6 +456,70 @@ func (s *Server) handleLaunchPackage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "launched", "package": r.PathValue("pkg")})
+}
+
+func (s *Server) handleRegions(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.svc.Regions())
+}
+
+func (s *Server) handleListProxies(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.svc.ListProxies())
+}
+
+func (s *Server) handleAddProxy(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Label string `json:"label"`
+		Proxy string `json:"proxy"`
+	}
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	p, err := s.svc.AddProxy(in.Label, in.Proxy)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, p)
+}
+
+func (s *Server) handleDeleteProxy(w http.ResponseWriter, r *http.Request) {
+	if err := s.svc.DeleteProxy(r.PathValue("id")); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "id": r.PathValue("id")})
+}
+
+func (s *Server) handleSetRegion(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		State string `json:"state"`
+	}
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	region, err := s.svc.SetRegion(r.PathValue("name"), in.State)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "region": region})
+}
+
+func (s *Server) handleSetProxy(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Proxy string `json:"proxy"`
+	}
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.svc.SetProxy(r.PathValue("name"), in.Proxy); err != nil {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "proxy": in.Proxy})
 }
 
 func (s *Server) withLogging(next http.Handler) http.Handler {

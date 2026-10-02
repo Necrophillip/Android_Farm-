@@ -12,20 +12,42 @@ type metricsStore struct {
 	mu      sync.RWMutex
 	history map[string][]MetricPoint
 	latest  map[string]Metrics
+	prev    map[string]netSample
 	max     int
+}
+
+type netSample struct {
+	rx int64
+	tx int64
+	at time.Time
 }
 
 func newMetricsStore() *metricsStore {
 	return &metricsStore{
 		history: make(map[string][]MetricPoint),
 		latest:  make(map[string]Metrics),
+		prev:    make(map[string]netSample),
 		max:     90,
 	}
 }
 
-func (s *metricsStore) record(name string, pid int, cpu float64, memBytes, uptime int64, totalMem int64) {
+func (s *metricsStore) record(name string, pid int, cpu float64, memBytes, uptime int64, totalMem, rx, tx int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	now := time.Now()
+	var rxRate, txRate int64
+	if p, ok := s.prev[name]; ok {
+		if dt := now.Sub(p.at).Seconds(); dt > 0 {
+			if rx >= p.rx {
+				rxRate = int64(float64(rx-p.rx) / dt)
+			}
+			if tx >= p.tx {
+				txRate = int64(float64(tx-p.tx) / dt)
+			}
+		}
+	}
+	s.prev[name] = netSample{rx: rx, tx: tx, at: now}
 
 	point := MetricPoint{T: nowMillis(), CPU: cpu, Mem: memBytes}
 	hist := append(s.history[name], point)
@@ -40,6 +62,10 @@ func (s *metricsStore) record(name string, pid int, cpu float64, memBytes, uptim
 		CPU:       cpu,
 		MemBytes:  memBytes,
 		UptimeSec: uptime,
+		RxBytes:   rx,
+		TxBytes:   tx,
+		RxRate:    rxRate,
+		TxRate:    txRate,
 		History:   append([]MetricPoint(nil), hist...),
 		UpdatedAt: nowMillis(),
 	}
@@ -64,6 +90,7 @@ func (s *metricsStore) prune(alive map[string]bool) {
 		if !alive[name] {
 			delete(s.latest, name)
 			delete(s.history, name)
+			delete(s.prev, name)
 		}
 	}
 }
@@ -152,7 +179,8 @@ func (s *Service) sample() {
 	for _, p := range procs {
 		alive[p.Name] = true
 		if cpu, mem, up, ok := readProcessStats(p.PID); ok {
-			s.metrics.record(p.Name, p.PID, cpu, mem, up, total)
+			rx, tx, _ := readDeviceTraffic(s.cfg.ADBBin, p.Serial)
+			s.metrics.record(p.Name, p.PID, cpu, mem, up, total, rx, tx)
 		}
 	}
 	s.metrics.prune(alive)
