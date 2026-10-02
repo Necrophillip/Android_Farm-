@@ -47,8 +47,18 @@ type Service struct {
 	bake      *bakeManager
 	sizeCache sync.Map // device name -> [2]int (w,h)
 
+	shotMu    sync.Mutex
+	shotCache map[string]cachedShot
+
 	subMu sync.Mutex
 	subs  map[chan Snapshot]struct{}
+}
+
+// cachedShot is a short-lived framebuffer capture keyed by device name so that
+// multiple viewers share a single screencap.
+type cachedShot struct {
+	png []byte
+	at  time.Time
 }
 
 // Snapshot is a full UI state pushed to subscribers over SSE.
@@ -64,10 +74,11 @@ type Snapshot struct {
 
 func NewService(cfg Config) *Service {
 	s := &Service{
-		cfg:      cfg,
-		metrics:  newMetricsStore(),
-		totalMem: totalSystemMem(),
-		subs:     make(map[chan Snapshot]struct{}),
+		cfg:       cfg,
+		metrics:   newMetricsStore(),
+		totalMem:  totalSystemMem(),
+		subs:      make(map[chan Snapshot]struct{}),
+		shotCache: make(map[string]cachedShot),
 	}
 	if cfg.MacroDir != "" {
 		s.macros = newMacroStore(cfg.MacroDir)
@@ -520,7 +531,11 @@ func (s *Service) StopAVD(name string) error {
 	if err != nil {
 		return err
 	}
-	return s.manager().Stop(serial)
+	err = s.manager().Stop(serial)
+	if err == nil {
+		s.pruneShot(name)
+	}
+	return err
 }
 
 func (s *Service) resolveSerial(name string) (string, error) {
@@ -536,8 +551,20 @@ func (s *Service) resolveSerial(name string) (string, error) {
 	return "", fmt.Errorf("no running emulator named %s", name)
 }
 
-// Screenshot captures the device framebuffer as PNG bytes.
-func (s *Service) Screenshot(name string) ([]byte, error) {
+// Screenshot captures the device framebuffer as PNG bytes. Results are cached
+// for a short TTL so concurrent viewers share one capture; pass force=true to
+// bypass the cache for an on-demand fresh frame.
+func (s *Service) Screenshot(name string, force bool) ([]byte, error) {
+	if !force {
+		s.shotMu.Lock()
+		if c, ok := s.shotCache[name]; ok && time.Since(c.at) < screenshotTTL {
+			png := c.png
+			s.shotMu.Unlock()
+			return png, nil
+		}
+		s.shotMu.Unlock()
+	}
+
 	serial, err := s.resolveSerial(name)
 	if err != nil {
 		return nil, err
@@ -552,7 +579,29 @@ func (s *Service) Screenshot(name string) ([]byte, error) {
 	if len(out) == 0 {
 		return nil, errors.New("empty screencap")
 	}
+	s.shotMu.Lock()
+	s.shotCache[name] = cachedShot{png: out, at: time.Now()}
+	s.shotMu.Unlock()
 	return out, nil
+}
+
+const screenshotTTL = time.Second
+
+// pruneShots drops cached frames for devices that are no longer running.
+func (s *Service) pruneShots(alive map[string]bool) {
+	s.shotMu.Lock()
+	for name := range s.shotCache {
+		if !alive[name] {
+			delete(s.shotCache, name)
+		}
+	}
+	s.shotMu.Unlock()
+}
+
+func (s *Service) pruneShot(name string) {
+	s.shotMu.Lock()
+	delete(s.shotCache, name)
+	s.shotMu.Unlock()
 }
 
 // Input forwards a remote control action to the device.
